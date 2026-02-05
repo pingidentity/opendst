@@ -53,12 +53,12 @@ public final class Server {
                 /* if (determinismStressorEnabled) {
                     stressor.stress(code);
                 } */
-                out.printf("Level 0 unlocked :)%n");
+                out.printf("Level 0 unlocked%n");
                 if (code == SECRET_SEQUENCE[currentLevel]) {
                     currentLevel++;
                     out.printf("Level %d unlocked :)%n", currentLevel);
                     if (currentLevel == SECRET_SEQUENCE.length) {
-                        out.println("Goal Reached!");
+                        out.println("Bug reached!");
                         currentLevel = 0;
                     }
                 } else if (currentLevel > 0) {

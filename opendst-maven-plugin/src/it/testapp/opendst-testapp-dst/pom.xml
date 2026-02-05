@@ -4,8 +4,9 @@
     <modelVersion>4.0.0</modelVersion>
     <parent>
         <groupId>com.pingidentity.opendst</groupId>
-        <artifactId>opendst</artifactId>
+        <artifactId>opendst-testapp-parent</artifactId>
         <version>0.0.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
     </parent>
 
     <artifactId>opendst-testapp-dst</artifactId>
@@ -24,6 +25,11 @@
             <artifactId>opendst-simulator</artifactId>
             <version>${project.version}</version>
             <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>3.27.7</version>
         </dependency>
     </dependencies>
 
@@ -48,9 +54,6 @@
                                     <type>war</type>
                                     <overWrite>true</overWrite>
                                     <outputDirectory>target/wars/opendst-testapp</outputDirectory>
-
-                                    <!-- outputDirectory>${maven.multiModuleProjectDirectory}/target/wars/opendst
-                                    -testapp</outputDirectory -->
                                 </artifactItem>
                             </artifactItems>
                         </configuration>
@@ -70,9 +73,6 @@
                     <signalPatterns>
                         <signalPattern>Level (?&lt;level&gt;\d+) unlocked</signalPattern>
                     </signalPatterns>
-                    <failurePatterns>
-                        <failurePattern>Goal Reached!</failurePattern>
-                    </failurePatterns>
                 </configuration>
                 <executions>
                     <execution>

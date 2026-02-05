@@ -149,7 +149,7 @@ public class ContinuousTestMojo extends AbstractMojo {
 
         // Allow command line -Dopendst.parallelism to override pom.xml configuration
         // unless debug is enabled, which forces it to 1
-        if (isDebug() || isReplay()) {
+        if (isDebug()) {
             getLog().info("Debug mode enabled. Forcing parallelism to 1 and enabling JVM debug agent.");
             this.parallelism = 1;
         } else {
@@ -168,15 +168,18 @@ public class ContinuousTestMojo extends AbstractMojo {
         getLog().info("  Class: " + testClass);
         getLog().info("  Method: " + testMethod);
         getLog().info("  Parallelism: " + parallelism);
-        if (isDebug()) {
-            String args = getDebugArgs();
+        if (isReplay()) {
+            getLog().info("  Mode: Replay (Single run)");
+            getLog().info("  Plan: " + planFile);
+            getLog().info("  Debug Args: " + getDebugArgs());
+        } else if (isDebug()) {
             getLog().info("  Mode: Debug (Single run)");
-            getLog().info("  Debug Args: " + args);
+            getLog().info("  Debug Args: " + getDebugArgs());
         }
 
-        orchestrator = planFile != null
+        orchestrator = isReplay()
                 ? new ReplayOrchestrator(JSON.std.beanFrom(Plan.class, planFile))
-                : new AcoOrchestrator(signalPatterns, failurePatterns);
+                : new AcoOrchestrator(project.getBasedir(), signalPatterns, failurePatterns);
         try (var executor = newFixedThreadPool(parallelism)) {
             var classpathElements = new ArrayList<>(project.getRuntimeClasspathElements());
             // TODO: Ultimately, we should have only add the MethodRunner class on the classpath.
@@ -198,7 +201,7 @@ public class ContinuousTestMojo extends AbstractMojo {
     }
 
     private void runLoop(String classpath) {
-        if (isDebug() || isReplay()) {
+        if (isDebug() | isReplay()) {
             try {
                 // In debug, we just run once with a fresh plan
                 runOnce(classpath, orchestrator.nextPlan());

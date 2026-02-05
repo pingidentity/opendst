@@ -23,10 +23,10 @@ import static java.lang.Math.max;
 import static java.lang.Math.round;
 import static java.lang.System.err;
 import static java.lang.System.exit;
+import static java.lang.System.out;
 import static java.time.Duration.ofSeconds;
 import static java.util.Comparator.comparing;
 import static java.util.Objects.hash;
-import static java.util.UUID.randomUUID;
 import static java.util.concurrent.ThreadLocalRandom.current;
 import static net.openhft.hashing.LongHashFunction.xx3;
 
@@ -35,6 +35,7 @@ import it.unimi.dsi.fastutil.longs.AbstractLong2ObjectMap.BasicEntry;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import java.io.File;
+import java.io.IOException;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -64,6 +65,8 @@ final class AcoOrchestrator implements Orchestrator {
 
     private static final double PHEROMONES_LOW_LIMIT = 0.1;
     private static final double PHEROMONES_EVAPORATION = 0.1;
+    private static final int SAVED_FAILURE_PLAN_MAX = 20;
+    private static final String SAVED_FAILURE_PLAN_DIR = "target/opendst/failures";
 
     private static final class NGram {
         private final String[] signals;
@@ -101,7 +104,7 @@ final class AcoOrchestrator implements Orchestrator {
         }
     }
 
-    private record LogStatement(String rid, long it, String source, LogMessage log) {
+    record LogStatement(String rid, long it, String source, LogMessage log) {
         boolean isValid() {
             return rid != null && source != null && log != null && log.message != null;
         }
@@ -251,8 +254,9 @@ final class AcoOrchestrator implements Orchestrator {
     }
 
     /** Track the moment at witch signals have been received */
-    private final List<Pattern> compiledPatterns = new ArrayList<>();
+    private final File baseDir;
 
+    private final List<Pattern> compiledPatterns = new ArrayList<>();
     private final List<Pattern> compiledFailurePatterns = new ArrayList<>();
     private final BloomFilter boringSequences = new BloomFilter(1_000_000, 0.01);
     private final Long2ObjectOpenHashMap<Moment> interestingSequences = new Long2ObjectOpenHashMap<>();
@@ -265,7 +269,8 @@ final class AcoOrchestrator implements Orchestrator {
     private long consecutiveNonDiscoveries;
     private long runSinceLastPrune;
 
-    AcoOrchestrator(Collection<String> signalLogPatterns, Collection<String> failureLogPatterns) {
+    AcoOrchestrator(File baseDir, Collection<String> signalLogPatterns, Collection<String> failureLogPatterns) {
+        this.baseDir = baseDir;
         if (signalLogPatterns != null) {
             signalLogPatterns.stream().map(Pattern::compile).forEach(compiledPatterns::add);
         }
@@ -313,7 +318,7 @@ final class AcoOrchestrator implements Orchestrator {
         var log = parseLogOrNull(logLine);
         if (log == null || !log.isValid()) {
             // TODO: Silent repetitive logs (e.g. JVM warnings). They're producing lot of noise
-            err.printf("Ignored: %s%n", logLine);
+            // err.printf("Ignored: %s%n", logLine);
             return;
         }
         // TODO: Remove this hashmap lookup from hot path
@@ -324,8 +329,11 @@ final class AcoOrchestrator implements Orchestrator {
         } else if (log.isEndOfSimulation() && !isDeterministic(timeline, plan, logLine)) {
             exit(1);
         } else if (failurePatternDetected(plan, logLine, log)) {
+            if (!isDeterministic(timeline, plan, logLine)) {
+                exit(1);
+            }
             // TODO: Add option to continue on failure ?
-            exit(1);
+            // exit(1);
         } else {
             detectSignal(timeline, log.it(), logLine);
         }
@@ -344,7 +352,9 @@ final class AcoOrchestrator implements Orchestrator {
         if (previousRun == null) {
             timeline.setLastLogLine(line);
             return true;
-        } else if (previousRun.equals(line)) {
+        }
+        if (JSON.std.anyFrom(previousRun).equals(JSON.std.anyFrom(line))) {
+            out.printf("Determinism verified for timeline %d%n", timeline.id());
             return true;
         } else {
             var pathOrNull = savePlanOrNull(plan);
@@ -411,7 +421,8 @@ final class AcoOrchestrator implements Orchestrator {
                 } else if (iteration < bestKnownMoment.iteration()) {
                     consecutiveNonDiscoveries = 0;
                     var moment = timeline.getMomentAt(iteration);
-                    moment.incrementPheromones(bestKnownMoment.iteration() * 1.4);
+                    moment.incrementPheromones(
+                            bestKnownMoment.pheromones() * (1.4 + (max(10, consecutiveNonDiscoveries) / 10.0)));
                     var bah = boringSequences.mightContain(sequence);
                     interestingSequences.put(sequence, moment);
                     System.out.printf(
@@ -456,29 +467,41 @@ final class AcoOrchestrator implements Orchestrator {
 
         if (code != 0) {
             var pathOrNull = savePlanOrNull(plan);
-            if (pathOrNull != null) {
-                err.printf(
-                        "The simulation has terminated unexpectedly with error code '%d'. Plan saved to '%s'%n",
-                        code, pathOrNull);
+            if (code == 1) {
+                if (pathOrNull != null) {
+                    err.printf(
+                            "The simulator has found a problem with the plan saved to '%s': %s%n",
+                            pathOrNull, timelineOrNull.lastLogLineOrNull());
+                } else {
+                    err.printf("The simulator has found a problem with the plan '%s'%n", JSON.std.asString(plan));
+                }
             } else {
-                err.printf(
-                        "The simulation has terminated unexpectedly with error code '%d'. Plan '%s'%n",
-                        code, JSON.std.asString(plan));
+                if (pathOrNull != null) {
+                    err.printf("The simulation has failed unexpectedly with the plan saved to '%s'%n", pathOrNull);
+                } else {
+                    err.printf("The simulation has failed unexpectedly with the plan '%s'%n", JSON.std.asString(plan));
+                }
             }
         }
     }
 
-    private static String savePlanOrNull(Plan plan) {
-        try {
-            var failureDir = new File("target/opendst/failures");
-            failureDir.mkdirs();
-            var failureFile = new File(failureDir, "failure-%s.json".formatted(randomUUID()));
-            JSON.std.write(plan, failureFile);
-            return failureFile.getAbsolutePath();
-        } catch (Exception e) {
-            err.println("Failed to save plan: " + e.getMessage());
-            return null;
+    private String savePlanOrNull(Plan plan) {
+        var dir = new File(baseDir, SAVED_FAILURE_PLAN_DIR);
+        dir.mkdirs();
+        for (int i = 1; i <= SAVED_FAILURE_PLAN_MAX; i++) {
+            var failureFile = new File(dir, "failure-%d.json".formatted(i));
+            try {
+                if (failureFile.createNewFile()) {
+                    JSON.std.write(plan, failureFile);
+                    return failureFile.getAbsolutePath();
+                }
+            } catch (IOException | JacksonException e) {
+                err.printf("Unable to save plan '%s': %s%n", failureFile.getAbsolutePath(), e.getMessage());
+                return null;
+            }
         }
+        err.println("There 'failures' directory is full, no more failure will be saved.");
+        return null;
     }
 
     private Moment selectInterestingMomentOrNull() {

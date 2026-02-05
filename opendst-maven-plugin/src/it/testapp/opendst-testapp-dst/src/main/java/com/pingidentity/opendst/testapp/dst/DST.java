@@ -21,19 +21,27 @@ import static com.pingidentity.opendst.Deployment.deployment;
 import static com.pingidentity.opendst.Simulator.runSimulation;
 import static java.net.InetAddress.ofLiteral;
 import static java.util.List.of;
-
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
 import java.nio.file.Path;
+
+import org.assertj.core.api.Assertions;
+
+import com.pingidentity.opendst.LogProcessor;
 
 public class DST {
     public static final Path WAR = Path.of("opendst-testapp");
 
     public void run() throws IOException {
-        runSimulation(deployment(
-                of(image("server-image", WAR, "com.pingidentity.opendst.testapp.Server"),
-                   image("client-image", WAR, "com.pingidentity.opendst.testapp.Client")),
-                of(service("server", "server-image", ofLiteral("10.0.0.2"), new String[]{ "8080"}),
-                   service("client", "client-image", ofLiteral("10.0.0.3"), new String[]{"10.0.0.2", "8080"}))));
+        runSimulation(
+                deployment(
+                        of(image("server-image", WAR, "com.pingidentity.opendst.testapp.Server"),
+                           image("client-image", WAR, "com.pingidentity.opendst.testapp.Client")),
+                        of(service("server", "server-image", ofLiteral("10.0.0.2"), new String[]{ "8080"}),
+                           service("client", "client-image", ofLiteral("10.0.0.3"), new String[]{"10.0.0.2", "8080"}))),
+                log -> assertThat(log.message())
+                        .describedAs("Bug detected by the log-processor")
+                        .doesNotContain("Bug reached!"));
     }
 }

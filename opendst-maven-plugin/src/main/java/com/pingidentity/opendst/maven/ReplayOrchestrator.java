@@ -15,8 +15,16 @@
  */
 package com.pingidentity.opendst.maven;
 
+import static java.lang.System.err;
+
+import com.pingidentity.opendst.maven.AcoOrchestrator.LogStatement;
+import tools.jackson.core.JacksonException;
+import tools.jackson.jr.ob.JSON;
+
 public final class ReplayOrchestrator implements Orchestrator {
     private final Plan plan;
+    private String lastLogOrNull;
+    private boolean done;
 
     public ReplayOrchestrator(Plan plan) {
         this.plan = plan;
@@ -28,8 +36,23 @@ public final class ReplayOrchestrator implements Orchestrator {
     }
 
     @Override
-    public void onLogReceived(Plan plan, String logLine) {}
+    public void onLogReceived(Plan plan, String logLine) {
+        try {
+            var log = JSON.std.beanFrom(LogStatement.class, logLine);
+            if (log.isEndOfSimulation()) {
+                lastLogOrNull = logLine;
+            }
+        } catch (JacksonException e) {
+            // Ignore badly formatted logs
+        }
+    }
 
     @Override
-    public void onPlanTerminated(Plan plan, int code) {}
+    public void onPlanTerminated(Plan plan, int code) {
+        if (code == 1) {
+            err.printf("The simulation has found a problem: %s%n", lastLogOrNull);
+        } else if (code != 0) {
+            err.printf("The simulation has failed unexpectedly: %s%n", lastLogOrNull);
+        }
+    }
 }
