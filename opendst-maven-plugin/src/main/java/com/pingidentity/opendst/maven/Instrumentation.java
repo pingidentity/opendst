@@ -213,24 +213,28 @@ final class Instrumentation {
     }
 
     private static final ClassDesc VIRTUAL_THREAD_DESC = ClassDesc.ofDescriptor("Ljava/lang/VirtualThread;");
+    private static final ClassDesc TIMER_DESC = ClassDesc.ofDescriptor("Ljava/util/Timer;");
     private static final ClassDesc OBJECT_DESC = ClassDesc.ofDescriptor("Ljava/lang/Object;");
 
     /**
      * Creates a {@link ClassFile} instance configured with the given classloader for hierarchy resolution.
      *
-     * <p>The fallback resolver handles {@code SimulatorThread} explicitly: it is injected via
-     * {@code --patch-module} at runtime but is not visible to the classloader at build time.
-     * Without this, stack map frame recomputation would resolve {@code SimulatorThread} as
-     * {@code Object}, causing {@link VerifyError} at runtime for any class that extends
-     * {@code SimulatorThread} (i.e. rewritten Thread subclasses).
+     * <p>The fallback resolver handles classes injected via {@code --patch-module} at runtime but not
+     * visible to the build-time classloader: {@code SimulatorThread} (extends {@code VirtualThread}) and
+     * {@code SimulatorTimer} (extends {@code Timer}). Without these mappings, stack map frame
+     * recomputation would resolve them as {@code Object}, causing {@link VerifyError} at runtime for
+     * any rewritten call site (e.g. {@code Timer t = new SimulatorTimer(...)}).
      */
     private static ClassFile newClassFile(URLClassLoader loader) {
         return ClassFile.of(
                 ClassHierarchyResolverOption.of(ofClassLoading(loader).orElse(desc -> {
                     if ("Ljava/lang/SimulatorThread;".equals(desc.descriptorString())) {
                         return ClassHierarchyResolver.ClassHierarchyInfo.ofClass(VIRTUAL_THREAD_DESC);
+                    } else if ("Ljava/util/SimulatorTimer;".equals(desc.descriptorString())) {
+                        return ClassHierarchyResolver.ClassHierarchyInfo.ofClass(TIMER_DESC);
+                    } else {
+                        return ClassHierarchyResolver.ClassHierarchyInfo.ofClass(OBJECT_DESC);
                     }
-                    return ClassHierarchyResolver.ClassHierarchyInfo.ofClass(OBJECT_DESC);
                 })));
     }
 
@@ -371,10 +375,12 @@ final class Instrumentation {
      */
     static final class CallSiteTransform {
         private static final ClassDesc SIMULATOR_THREAD_CLASS = ClassDesc.of("java.lang.SimulatorThread");
+        private static final ClassDesc SIMULATOR_TIMER_CLASS = ClassDesc.of("java.util.SimulatorTimer");
         private static final ClassDesc SIGNALS_IMPL_CLASS = ClassDesc.of("com.pingidentity.opendst.sdk.SignalsImpl");
         private static final ClassDesc ASSERT_IMPL_CLASS = ClassDesc.of("com.pingidentity.opendst.sdk.AssertImpl");
 
         private static final String THREAD_INTERNAL = "java/lang/Thread";
+        private static final String TIMER_INTERNAL = "java/util/Timer";
 
         /** Maps internal class names of static method sources to their deterministic redirect targets. */
         static final Map<String, ClassDesc> REDIRECT_STATIC_METHODS = Map.ofEntries(
@@ -428,6 +434,8 @@ final class Instrumentation {
          * <ul>
          *   <li>{@code NEW java/lang/Thread} → {@code NEW java/lang/SimulatorThread}</li>
          *   <li>{@code INVOKESPECIAL Thread.<init>} → {@code INVOKESPECIAL SimulatorThread.<init>}</li>
+         *   <li>{@code NEW java/util/Timer} → {@code NEW java/util/SimulatorTimer}</li>
+         *   <li>{@code INVOKESPECIAL Timer.<init>} → {@code INVOKESPECIAL SimulatorTimer.<init>}</li>
          *   <li>{@code INVOKESTATIC Signals/Assert.method()} → {@code INVOKESTATIC SignalsImpl/AssertImpl.method()}</li>
          * </ul>
          */
@@ -437,6 +445,8 @@ final class Instrumentation {
                 switch (element) {
                     case NewObjectInstruction i
                     when THREAD_INTERNAL.equals(i.className().asInternalName()) -> builder.new_(SIMULATOR_THREAD_CLASS);
+                    case NewObjectInstruction i
+                    when TIMER_INTERNAL.equals(i.className().asInternalName()) -> builder.new_(SIMULATOR_TIMER_CLASS);
                     case InvokeInstruction i -> handleInvoke(builder, i);
                     default -> builder.with(element);
                 }
@@ -450,6 +460,12 @@ final class Instrumentation {
                     // Rewrite Thread.<init> → SimulatorThread.<init> (same descriptor).
                     // Covers both: new Thread(runnable) and super() calls in Thread subclasses.
                     builder.invokespecial(SIMULATOR_THREAD_CLASS, "<init>", i.typeSymbol());
+                } else if (i.opcode() == INVOKESPECIAL
+                        && TIMER_INTERNAL.equals(owner)
+                        && i.method().name().equalsString("<init>")) {
+                    // Rewrite Timer.<init> → SimulatorTimer.<init> (same descriptor).
+                    // Covers `new Timer(...)` and any future super() calls from Timer subclasses.
+                    builder.invokespecial(SIMULATOR_TIMER_CLASS, "<init>", i.typeSymbol());
                 } else if (i.opcode() == INVOKESTATIC && REDIRECT_STATIC_METHODS.containsKey(owner)) {
                     var targetClass = Objects.requireNonNull(REDIRECT_STATIC_METHODS.get(owner));
                     builder.invokestatic(targetClass, i.method().name().toString(), i.typeSymbol());

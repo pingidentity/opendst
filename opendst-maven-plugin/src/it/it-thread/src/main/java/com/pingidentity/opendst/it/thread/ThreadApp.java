@@ -16,12 +16,16 @@
 package com.pingidentity.opendst.it.thread;
 
 import com.pingidentity.opendst.sdk.Assert;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.LogManager;
 
 /**
  * Exercises thread-related determinism guards under OpenDST simulation.
  *
- * <p>Tests two areas:
+ * <p>Tests three areas:
  * <ol>
  *   <li><strong>Platform thread shutdown hooks</strong> — {@link LogManager} initialization
  *       registers a {@code LogManager$Cleaner} shutdown hook (a platform thread). The agent
@@ -29,6 +33,11 @@ import java.util.logging.LogManager;
  *   <li><strong>Thread subclasses</strong> — Direct and transitive {@code Thread} subclasses
  *       are rewritten to extend {@code SimulatorThread} and must run correctly under simulation
  *       (identity, instanceof, join, overridden run()).</li>
+ *   <li><strong>{@code java.util.Timer}</strong> — {@code new Timer(...)} call sites are
+ *       rewritten to construct {@code SimulatorTimer}, whose worker is a virtual
+ *       {@code SimulatorThread} rather than the legacy {@code TimerThread} platform thread.
+ *       One-shot and recurring schedules must fire, the worker must be virtual, and
+ *       {@code cancel()} must stop subsequent firings.</li>
  * </ol>
  */
 public final class ThreadApp {
@@ -45,19 +54,10 @@ public final class ThreadApp {
         public void run() {
             Assert.reachable("worker-run");
 
-            // Verify currentThread() returns this instance
+            // currentThread() must return this instance, and be an instanceof WorkerThread.
             var current = Thread.currentThread();
-            if (current != this) {
-                throw new AssertionError(
-                        "currentThread() returned wrong instance: expected " + this + " but got " + current);
-            }
-            Assert.reachable("worker-identity");
-
-            // Verify instanceof
-            if (!(current instanceof WorkerThread)) {
-                throw new AssertionError("currentThread() is not instanceof WorkerThread: " + current.getClass());
-            }
-            Assert.reachable("worker-instanceof");
+            Assert.always(current == this, "worker-identity");
+            Assert.always(current instanceof WorkerThread, "worker-instanceof");
 
             completed = true;
         }
@@ -76,12 +76,8 @@ public final class ThreadApp {
             super.run();
             Assert.reachable("special-worker-run");
 
-            if (!(Thread.currentThread() instanceof SpecialWorkerThread)) {
-                throw new AssertionError(
-                        "currentThread() is not instanceof SpecialWorkerThread: "
-                                + Thread.currentThread().getClass());
-            }
-            Assert.reachable("special-worker-instanceof");
+            Assert.always(
+                    Thread.currentThread() instanceof SpecialWorkerThread, "special-worker-instanceof");
             specialCompleted = true;
         }
     }
@@ -111,28 +107,69 @@ public final class ThreadApp {
         var worker = new WorkerThread("test-worker");
         worker.start();
         worker.join(5000);
-        if (!worker.completed) {
-            throw new AssertionError("WorkerThread did not complete");
-        }
-        Assert.reachable("worker-joined");
+        Assert.always(worker.completed, "worker-joined");
 
         // Transitive subclass
         var special = new SpecialWorkerThread("special-worker");
         special.start();
         special.join(5000);
-        if (!special.specialCompleted) {
-            throw new AssertionError("SpecialWorkerThread did not complete");
-        }
-        Assert.reachable("special-joined");
+        Assert.always(special.specialCompleted, "special-joined");
 
         // No-arg constructor subclass
         var simple = new SimpleThread();
         simple.start();
         simple.join(5000);
-        if (!simple.completed) {
-            throw new AssertionError("SimpleThread did not complete");
-        }
-        Assert.reachable("simple-joined");
+        Assert.always(simple.completed, "simple-joined");
+
+        // ---- java.util.Timer redirect ----
+        // new Timer(...) call sites are rewritten to SimulatorTimer; the worker driving
+        // scheduled TimerTasks must be a virtual SimulatorThread, not a platform TimerThread.
+
+        // The result of new Timer(...) is statically a Timer reference — instanceof Timer
+        // must still hold after the redirect rewrite.
+        var timer = new Timer("test-timer");
+        Assert.always(timer instanceof Timer, "timer-is-timer");
+
+        // One-shot schedule: capture the worker thread's identity so we can assert it is virtual.
+        var oneShotFired = new AtomicInteger(0);
+        var workerWasVirtual = new AtomicBoolean(false);
+        timer.schedule(
+                new TimerTask() {
+                    @Override
+                    public void run() {
+                        workerWasVirtual.set(Thread.currentThread().isVirtual());
+                        oneShotFired.incrementAndGet();
+                    }
+                },
+                50);
+
+        // Recurring schedule: must fire at least 3 times before cancel.
+        var recurringFired = new AtomicInteger(0);
+        timer.scheduleAtFixedRate(
+                new TimerTask() {
+                    @Override
+                    public void run() {
+                        recurringFired.incrementAndGet();
+                    }
+                },
+                10,
+                20);
+
+        // Sleep long enough that one-shot fires and recurring fires several times.
+        Thread.sleep(200);
+
+        // One-shot must fire exactly once on a virtual worker thread.
+        Assert.always(oneShotFired.get() == 1, "timer-oneshot-fired");
+        Assert.always(workerWasVirtual.get(), "timer-worker-virtual");
+
+        // Recurring must fire several times before cancel.
+        int recurringBeforeCancel = recurringFired.get();
+        Assert.alwaysGreaterThanOrEqualTo(recurringBeforeCancel, 3, "timer-recurring-fired");
+
+        // Cancel must stop subsequent firings.
+        timer.cancel();
+        Thread.sleep(100);
+        Assert.always(recurringFired.get() == recurringBeforeCancel, "timer-cancelled");
 
         Assert.reachable("all-done");
     }

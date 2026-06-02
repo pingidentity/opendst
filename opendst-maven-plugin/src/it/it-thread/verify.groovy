@@ -3,6 +3,7 @@ import groovy.json.JsonSlurper
 // Verify thread-related determinism guards:
 // 1. Platform thread shutdown hooks (e.g. JUL's LogManager$Cleaner) must be skipped
 // 2. Thread subclasses are rewritten to extend SimulatorThread and run correctly
+// 3. java.util.Timer is redirected to SimulatorTimer (virtual worker, not TimerThread)
 
 File logFile = new File(basedir, "build.log")
 assert logFile.exists() : "The build.log file was not found!"
@@ -92,6 +93,11 @@ def expectedAssertions = [
     "special-joined",
     "simple-run",
     "simple-joined",
+    "timer-is-timer",
+    "timer-oneshot-fired",
+    "timer-worker-virtual",
+    "timer-recurring-fired",
+    "timer-cancelled",
     "all-done",
 ]
 def labels = report.assertions.collect { it.name }
