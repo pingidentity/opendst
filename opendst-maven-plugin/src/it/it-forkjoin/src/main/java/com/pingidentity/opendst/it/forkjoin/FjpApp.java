@@ -16,10 +16,13 @@
 package com.pingidentity.opendst.it.forkjoin;
 
 import com.pingidentity.opendst.sdk.Assert;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -89,6 +92,60 @@ public final class FjpApp {
                 .join();
         Assert.always("xy".equals(cfResult), "completablefuture-correct");
         Assert.always(!cfRanOnWorker.get(), "completablefuture-no-worker");
+
+        // Arrays.parallelSort(Object[], Comparator) on an array larger than the parallel grain size —
+        // the agent redirects it to the sequential sort, so the comparator never runs on a worker.
+        Integer[] arr = new Integer[20_000];
+        for (int i = 0; i < arr.length; i++) {
+            arr[i] = arr.length - i;
+        }
+        var sortRanOnWorker = new AtomicBoolean(false);
+        Arrays.parallelSort(arr, (x, y) -> {
+            if (onForkJoinWorker()) {
+                sortRanOnWorker.set(true);
+            }
+            return Integer.compare(x, y);
+        });
+        boolean comparatorSorted = true;
+        for (int i = 0; i < arr.length; i++) {
+            if (arr[i] != i + 1) {
+                comparatorSorted = false;
+                break;
+            }
+        }
+        Assert.always(comparatorSorted, "arrays-parallelsort-correct");
+        Assert.always(!sortRanOnWorker.get(), "arrays-parallelsort-no-worker");
+
+        // A primitive parallelSort overload (int[]) is redirected to the sequential sort too.
+        int[] prim = new int[20_000];
+        for (int i = 0; i < prim.length; i++) {
+            prim[i] = prim.length - i;
+        }
+        Arrays.parallelSort(prim);
+        boolean primitiveSorted = true;
+        for (int i = 0; i < prim.length; i++) {
+            if (prim[i] != i + 1) {
+                primitiveSorted = false;
+                break;
+            }
+        }
+        Assert.always(primitiveSorted, "arrays-parallelsort-primitive-correct");
+
+        // ConcurrentHashMap bulk forEach with threshold 1 (would normally fork) — runs in the caller.
+        var chm = new ConcurrentHashMap<Integer, Integer>();
+        for (int i = 0; i < 1000; i++) {
+            chm.put(i, i);
+        }
+        var chmRanOnWorker = new AtomicBoolean(false);
+        var chmSum = new LongAdder();
+        chm.forEach(1, (k, v) -> {
+            if (onForkJoinWorker()) {
+                chmRanOnWorker.set(true);
+            }
+            chmSum.add(v);
+        });
+        Assert.always(chmSum.sum() == 499_500, "chm-bulk-correct");
+        Assert.always(!chmRanOnWorker.get(), "chm-bulk-no-worker");
 
         Assert.reachable("all-done");
     }

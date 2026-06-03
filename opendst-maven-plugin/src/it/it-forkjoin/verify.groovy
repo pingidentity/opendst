@@ -76,6 +76,11 @@ def expectedAssertions = [
     "streams-caller-ran",
     "completablefuture-correct",
     "completablefuture-no-worker",
+    "arrays-parallelsort-correct",
+    "arrays-parallelsort-no-worker",
+    "arrays-parallelsort-primitive-correct",
+    "chm-bulk-correct",
+    "chm-bulk-no-worker",
     "all-done",
 ]
 def labels = report.assertions.collect { it.name }
