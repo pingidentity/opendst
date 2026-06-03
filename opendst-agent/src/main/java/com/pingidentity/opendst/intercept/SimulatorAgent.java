@@ -61,6 +61,7 @@ public final class SimulatorAgent {
         agent = SystemInterceptors.instrument(agent);
         agent = RandomInterceptors.instrument(agent);
         agent = ThreadsInterceptors.instrument(agent);
+        agent = StreamInterceptors.instrument(agent);
         agent = NetworkInterceptors.instrument(agent);
 
         agent.installOn(instrumentation);
