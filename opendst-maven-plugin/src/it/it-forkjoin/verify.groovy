@@ -74,6 +74,8 @@ def expectedAssertions = [
     "intstream-correct",
     "parallelstream-correct",
     "streams-caller-ran",
+    "completablefuture-correct",
+    "completablefuture-no-worker",
     "all-done",
 ]
 def labels = report.assertions.collect { it.name }

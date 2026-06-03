@@ -16,7 +16,9 @@
 package com.pingidentity.opendst.it.forkjoin;
 
 import com.pingidentity.opendst.sdk.Assert;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ForkJoinWorkerThread;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -68,6 +70,25 @@ public final class FjpApp {
 
         // No stage of either stream may have run on a ForkJoinWorkerThread.
         Assert.always(workerHits.get() == 0, "streams-caller-ran");
+
+        // CompletableFuture.*Async() without an explicit executor — runs stage tasks on the common
+        // pool, which the agent reroutes to a node-scheduled virtual thread.
+        var cfRanOnWorker = new AtomicBoolean(false);
+        String cfResult = CompletableFuture.supplyAsync(() -> {
+                    if (onForkJoinWorker()) {
+                        cfRanOnWorker.set(true);
+                    }
+                    return "x";
+                })
+                .thenApplyAsync(s -> {
+                    if (onForkJoinWorker()) {
+                        cfRanOnWorker.set(true);
+                    }
+                    return s + "y";
+                })
+                .join();
+        Assert.always("xy".equals(cfResult), "completablefuture-correct");
+        Assert.always(!cfRanOnWorker.get(), "completablefuture-no-worker");
 
         Assert.reachable("all-done");
     }
