@@ -16,10 +16,13 @@
 package com.pingidentity.opendst.it.forkjoin;
 
 import com.pingidentity.opendst.sdk.Assert;
+import java.math.BigInteger;
 import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
+import java.util.concurrent.SubmissionPublisher;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
@@ -146,6 +149,18 @@ public final class FjpApp {
         });
         Assert.always(chmSum.sum() == 499_500, "chm-bulk-correct");
         Assert.always(!chmRanOnWorker.get(), "chm-bulk-no-worker");
+
+        // BigInteger.parallelMultiply on large operands forks onto the common pool; the agent forces
+        // it sequential, so it equals multiply() and no worker is spawned (checked via no platform
+        // thread escape in verify.groovy).
+        BigInteger big = BigInteger.ONE.shiftLeft(300_000).subtract(BigInteger.valueOf(123_457));
+        Assert.always(big.multiply(big).equals(big.parallelMultiply(big)), "biginteger-parallelmultiply-correct");
+
+        // SubmissionPublisher created without an executor uses the common pool; the agent reroutes
+        // it to a node virtual-thread executor, so its executor is no longer a ForkJoinPool.
+        try (var publisher = new SubmissionPublisher<Integer>()) {
+            Assert.always(!(publisher.getExecutor() instanceof ForkJoinPool), "submissionpublisher-rerouted");
+        }
 
         Assert.reachable("all-done");
     }
