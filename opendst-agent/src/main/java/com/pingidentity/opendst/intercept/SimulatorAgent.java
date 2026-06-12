@@ -20,8 +20,11 @@ import static java.lang.System.setProperty;
 import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
 import static net.bytebuddy.matcher.ElementMatchers.not;
 
+import com.pingidentity.opendst.simulator.Simulator.SimulationError;
 import java.io.IOException;
 import java.lang.instrument.Instrumentation;
+import java.lang.invoke.MethodHandles;
+import java.util.concurrent.ThreadLocalRandom;
 import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.agent.builder.AgentBuilder.Default;
@@ -43,6 +46,15 @@ public final class SimulatorAgent {
      * @param instrumentation The instrumentation instance to use for transforming classes.
      */
     public static void premain(String agentArgs, Instrumentation instrumentation) throws IOException {
+        // Force ThreadLocalRandom class initialization before the transformer is installed.
+        // ConcurrentHashMap.fullAddCount() calls ThreadLocalRandom.getProbe(): if the *first* load
+        // of ThreadLocalRandom happens inside fullAddCount() while the transformer is active, the
+        // ByteBuddy transform path itself goes through ConcurrentHashMap and re-enters the load,
+        // failing with ClassCircularityError (observed on the "VirtualThread-unblocker" thread).
+        // Loading it here is safe: RedefinitionStrategy.REDEFINITION retransforms already-loaded
+        // classes when installOn() runs below, so deterministic randomness still applies.
+        ThreadLocalRandom.current();
+
         AgentBuilder agent = new Default()
                 .disableClassFormatChanges()
                 .enableNativeMethodPrefix("native")
@@ -72,6 +84,18 @@ public final class SimulatorAgent {
 
         installSimulatorThreadCallback();
         setProperty(AGENT_PROPERTY, "true");
+
+        // Force ThreadsInterceptors.Internals class initialization while still single-threaded.
+        // Its <clinit> calls MethodType.methodType() which goes through ConcurrentHashMap and
+        // would otherwise run lazily on whichever thread first touches Internals — typically the
+        // "VirtualThread-unblocker" thread racing the simulation thread (see ClassCircularityError
+        // note above). Doing it here, before the warmup below starts the unblocker thread, makes
+        // the initialization order deterministic.
+        try {
+            MethodHandles.lookup().ensureInitialized(ThreadsInterceptors.Internals.class);
+        } catch (IllegalAccessException e) {
+            throw new SimulationError("Unable to initialize ThreadsInterceptors.Internals", e);
+        }
 
         // Force VirtualThread class initialization outside the simulation context.
         // VirtualThread.<clinit> starts the "VirtualThread-unblocker" platform thread
