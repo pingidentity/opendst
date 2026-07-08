@@ -79,6 +79,7 @@ public final class SimulatorAgent {
         agent = BigIntegerInterceptors.instrument(agent);
         agent = SubmissionPublisherInterceptors.instrument(agent);
         agent = NetworkInterceptors.instrument(agent);
+        agent = FileSystemInterceptors.instrument(agent);
 
         agent.installOn(instrumentation);
 
