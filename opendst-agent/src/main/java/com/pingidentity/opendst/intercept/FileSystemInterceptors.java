@@ -19,20 +19,26 @@ import static com.pingidentity.opendst.simulator.Node.currentNodeOrNull;
 import static net.bytebuddy.asm.Advice.to;
 import static net.bytebuddy.matcher.ElementMatchers.isSubTypeOf;
 import static net.bytebuddy.matcher.ElementMatchers.named;
+import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 
 import com.pingidentity.opendst.simulator.Node;
+import java.io.IOException;
 import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.FileSystem;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchEvent.Modifier;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
 import java.nio.file.Watchable;
+import java.nio.file.attribute.FileAttribute;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import net.bytebuddy.agent.builder.AgentBuilder;
+import net.bytebuddy.asm.Advice.Argument;
 import net.bytebuddy.asm.Advice.Enter;
 import net.bytebuddy.asm.Advice.OnMethodEnter;
 import net.bytebuddy.asm.Advice.OnMethodExit;
@@ -41,9 +47,16 @@ import net.bytebuddy.asm.Advice.Return;
 import net.bytebuddy.asm.Advice.This;
 
 /**
- * Intercepts {@link FileSystem#newWatchService()} and {@link Path#register} to replace the native
- * OS watcher with no-op implementations when running inside a simulation node, preventing
- * context-free platform threads from being spawned.
+ * Intercepts file-system APIs to isolate each simulation node:
+ * <ul>
+ *   <li>{@link FileSystem#newWatchService()} and {@link Path#register} — replaced with no-op
+ *       implementations to prevent context-free platform threads from being spawned.</li>
+ *   <li>{@link Files#createTempFile(String, String, FileAttribute[])} and
+ *       {@link Files#createTempDirectory(String, FileAttribute[])} — redirected to a per-node
+ *       subdirectory ({@code tmp/<nodeName>/}) under the child JVM's working directory so that
+ *       different nodes never share the same temporary space and temp files are cleaned up with
+ *       the run.</li>
+ * </ul>
  */
 public final class FileSystemInterceptors {
 
@@ -158,6 +171,71 @@ public final class FileSystemInterceptors {
         }
     }
 
+    /**
+     * Intercepts {@link Files#createTempFile(String, String, FileAttribute[])} (no explicit dir)
+     * to redirect temp-file creation into a per-node directory under the child JVM's working
+     * directory ({@code tmp/<nodeName>/}), so different nodes never share the same temp space.
+     */
+    @Intercepts("java.nio.file.Files#createTempFile(String,String,FileAttribute[])")
+    public static final class FilesCreateTempFileAdvice {
+        @OnMethodEnter(skipOn = OnNonDefaultValue.class)
+        @SuppressWarnings("MissingJavadocMethod")
+        public static Node onEnter() {
+            return currentNodeOrNull();
+        }
+
+        @OnMethodExit
+        @SuppressWarnings({"MissingJavadocMethod", "ReassignedVariable", "ParameterCanBeLocal", "UnusedAssignment"})
+        public static void onExit(
+                @Enter Node node,
+                @Argument(0) String prefix,
+                @Argument(1) String suffix,
+                @Argument(2) FileAttribute<?>[] attrs,
+                @Return(readOnly = false) Path result)
+                throws IOException {
+            if (node != null) {
+                result = Files.createTempFile(nodeTmpDir(node), prefix, suffix, attrs);
+            }
+        }
+    }
+
+    /**
+     * Intercepts {@link Files#createTempDirectory(String, FileAttribute[])} (no explicit dir)
+     * to redirect temp-directory creation into a per-node directory under the child JVM's working
+     * directory ({@code tmp/<nodeName>/}).
+     */
+    @Intercepts("java.nio.file.Files#createTempDirectory(String,FileAttribute[])")
+    public static final class FilesCreateTempDirectoryAdvice {
+        @OnMethodEnter(skipOn = OnNonDefaultValue.class)
+        @SuppressWarnings("MissingJavadocMethod")
+        public static Node onEnter() {
+            return currentNodeOrNull();
+        }
+
+        @OnMethodExit
+        @SuppressWarnings({"MissingJavadocMethod", "ReassignedVariable", "ParameterCanBeLocal", "UnusedAssignment"})
+        public static void onExit(
+                @Enter Node node,
+                @Argument(0) String prefix,
+                @Argument(1) FileAttribute<?>[] attrs,
+                @Return(readOnly = false) Path result)
+                throws IOException {
+            if (node != null) {
+                result = Files.createTempDirectory(nodeTmpDir(node), prefix, attrs);
+            }
+        }
+    }
+
+    /**
+     * Returns (creating if absent) the per-node tmp directory:
+     * {@code <cwd>/tmp/<nodeName>/}.
+     */
+    private static Path nodeTmpDir(Node node) throws IOException {
+        var dir = Paths.get("").toAbsolutePath().resolve("tmp").resolve(node.hostName());
+        Files.createDirectories(dir);
+        return dir;
+    }
+
     static AgentBuilder instrument(AgentBuilder agent) {
         return agent.type(isSubTypeOf(FileSystem.class))
                 .transform((builder, _, _, _, _) ->
@@ -166,6 +244,15 @@ public final class FileSystemInterceptors {
                 .type(isSubTypeOf(Path.class))
                 .transform((builder, _, _, _, _) ->
                         builder.visit(to(PathRegisterAdvice.class).on(named("register"))))
+                .asTerminalTransformation()
+                /** {@link Files#createTempFile(String, String, FileAttribute[])} — no explicit dir */
+                .type(named("java.nio.file.Files"))
+                .transform((builder, _, _, _, _) -> builder.visit(to(FilesCreateTempFileAdvice.class)
+                                .on(named("createTempFile")
+                                        .and(takesArguments(String.class, String.class, FileAttribute[].class))))
+                        .visit(to(FilesCreateTempDirectoryAdvice.class)
+                                .on(named("createTempDirectory")
+                                        .and(takesArguments(String.class, FileAttribute[].class)))))
                 .asTerminalTransformation();
     }
 

@@ -20,7 +20,6 @@ import static com.pingidentity.opendst.common.Assertion.NO_TRACE_AUDITOR_EXCEPTI
 import static com.pingidentity.opendst.common.Assertion.NO_UNCAUGHT_EXCEPTION;
 import static com.pingidentity.opendst.common.Assertion.SIMULATION_STARTED;
 import static com.pingidentity.opendst.common.Assertion.SIMULATION_TERMINATED;
-import static com.pingidentity.opendst.common.Constants.APPS_DIR_PROPERTY;
 import static com.pingidentity.opendst.runner.Commons.JAVA_BASE_OPTIONS;
 import static com.pingidentity.opendst.runner.Commons.JSON_OBJECT;
 import static com.pingidentity.opendst.runner.Commons.deleteRecursively;
@@ -533,7 +532,8 @@ public final class RunnerCli implements Callable<Integer> {
 
     /**
      * Builds the {@code java ...} command line for a child JVM rooted at {@code runBaseDir}.
-     * Each run gets its own {@code tmp} directory.
+     * Each run gets its own {@code tmp} directory; the agent creates per-node subdirectories
+     * inside it when temp files are requested.
      *
      * <p>Layout under {@link #deploymentDir} is fixed by convention:
      * {@code system/*.jar} on the classpath, {@code system/opendst-agent.jar} as the
@@ -548,7 +548,6 @@ public final class RunnerCli implements Callable<Integer> {
         var javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         var agentJar = deploymentDir.resolve("system/opendst-agent.jar").toAbsolutePath();
         var patchJar = deploymentDir.resolve("system/opendst-patch.jar").toAbsolutePath();
-        var instrumentedAppsDir = deploymentDir.resolve("apps");
         var command = new ArrayList<String>();
         command.add(javaBin);
         command.addAll(JAVA_BASE_OPTIONS);
@@ -556,10 +555,7 @@ public final class RunnerCli implements Callable<Integer> {
         // SimulatorThread (extends non-final VirtualThread) into java.base.
         command.add("--patch-module");
         command.add("java.base=%s".formatted(patchJar));
-        command.addAll(List.of(
-                "-javaagent:%s".formatted(agentJar),
-                "-Djava.io.tmpdir=%s".formatted(runTmpDir),
-                "-D%s=%s".formatted(APPS_DIR_PROPERTY, instrumentedAppsDir)));
+        command.add("-javaagent:%s".formatted(agentJar));
         if (effectiveJvmArgs != null && !effectiveJvmArgs.isBlank()) {
             command.addAll(asList(effectiveJvmArgs.split(" +")));
         }
