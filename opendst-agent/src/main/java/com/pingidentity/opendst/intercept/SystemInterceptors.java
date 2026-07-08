@@ -67,6 +67,11 @@ public final class SystemInterceptors {
                 .type(named("java.lang.System"))
                 .transform((builder, _, _, _, _) ->
                         builder.visit(to(ConsoleAdvice.class).on(named("setOut").or(named("setErr")))))
+                .asTerminalTransformation()
+                /** {@link ProcessHandle#pid()} — returns real OS PID, which varies per JVM invocation */
+                .type(named("java.lang.ProcessHandleImpl"))
+                .transform((builder, _, _, _, _) ->
+                        builder.visit(to(ProcessHandlePidAdvice.class).on(named("pid"))))
                 .asTerminalTransformation();
     }
 
@@ -212,6 +217,34 @@ public final class SystemInterceptors {
         @SuppressWarnings("MissingJavadocMethod")
         public static Node onEnter() {
             return Node.currentNodeOrNull();
+        }
+    }
+
+    /**
+     * Overrides {@link ProcessHandle#pid()} to return a fixed value inside simulation nodes.
+     * The real OS PID changes on every JVM invocation, producing a non-deterministic signal
+     * in any log message that includes the PID (e.g. DS's "JVM Information: PID(NNNNN)...").
+     *
+     * <p>Could be removed if/when each simulation run is isolated in its own container (Docker or
+     * similar), since the PID could then be pinned at the OS level instead of intercepted here.
+     */
+    @Intercepts("java.lang.ProcessHandle#pid()")
+    public static final class ProcessHandlePidAdvice {
+        /** Deterministic PID returned inside simulation nodes. */
+        private static final long SIMULATED_PID = 1L;
+
+        @OnMethodEnter(skipOn = OnNonDefaultValue.class)
+        @SuppressWarnings("MissingJavadocMethod")
+        public static Node onEnter() {
+            return Node.currentNodeOrNull();
+        }
+
+        @OnMethodExit
+        @SuppressWarnings({"MissingJavadocMethod", "ReassignedVariable", "ParameterCanBeLocal", "UnusedAssignment"})
+        public static void onExit(@Enter Node node, @Return(readOnly = false) long pid) {
+            if (node != null) {
+                pid = SIMULATED_PID;
+            }
         }
     }
 }
