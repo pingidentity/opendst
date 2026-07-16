@@ -29,6 +29,15 @@
                     <execution>
                         <goals><goal>build</goal></goals>
                         <configuration>
+                            <deployment>
+                                <services>
+                                    <service>
+                                        <name>parent</name>
+                                        <className>com.pingidentity.opendst.it.nested.NestedStartNodeApp</className>
+                                        <ip>10.0.0.1</ip>
+                                    </service>
+                                </services>
+                            </deployment>
                             <jvmArguments>-XX:TieredStopAtLevel=1 -Xms64m -Xmx64m</jvmArguments>
                         </configuration>
                     </execution>

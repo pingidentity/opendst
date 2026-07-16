@@ -15,6 +15,8 @@
  */
 package com.pingidentity.opendst.maven;
 
+import static com.pingidentity.opendst.common.AssertType.ALWAYS;
+import static com.pingidentity.opendst.common.AssertType.SOMETIMES;
 import static com.pingidentity.opendst.maven.Instrumentation.CallSiteTransform.callSiteTransformMethod;
 import static com.pingidentity.opendst.maven.Instrumentation.CallSiteTransform.isDirectThreadSubclass;
 import static com.pingidentity.opendst.maven.Instrumentation.CallSiteTransform.threadSubclassTransform;
@@ -22,42 +24,44 @@ import static java.lang.classfile.ClassHierarchyResolver.ofClassLoading;
 import static java.lang.classfile.ClassTransform.transformingMethods;
 import static java.lang.classfile.Opcode.INVOKESPECIAL;
 import static java.lang.classfile.Opcode.INVOKESTATIC;
-import static java.nio.file.FileVisitResult.CONTINUE;
-import static java.nio.file.FileVisitResult.SKIP_SUBTREE;
-import static java.nio.file.Files.copy;
-import static java.nio.file.Files.createDirectories;
 import static java.nio.file.Files.exists;
-import static java.nio.file.Files.isDirectory;
-import static java.nio.file.Files.newOutputStream;
 import static java.nio.file.Files.readAllBytes;
 import static java.nio.file.Files.walk;
-import static java.nio.file.Files.walkFileTree;
-import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 import static java.util.Map.entry;
 
 import com.pingidentity.opendst.common.Assertion;
+import com.pingidentity.opendst.maven.ClasspathResolver.Classpath;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.classfile.ClassFile;
 import java.lang.classfile.ClassFile.ClassHierarchyResolverOption;
 import java.lang.classfile.ClassHierarchyResolver;
+import java.lang.classfile.ClassModel;
 import java.lang.classfile.ClassTransform;
 import java.lang.classfile.CodeBuilder;
 import java.lang.classfile.CodeElement;
 import java.lang.classfile.CodeModel;
 import java.lang.classfile.CodeTransform;
+import java.lang.classfile.Instruction;
+import java.lang.classfile.Opcode;
 import java.lang.classfile.Superclass;
+import java.lang.classfile.TypeKind;
+import java.lang.classfile.instruction.ConstantInstruction;
+import java.lang.classfile.instruction.FieldInstruction;
 import java.lang.classfile.instruction.InvokeInstruction;
+import java.lang.classfile.instruction.LineNumber;
+import java.lang.classfile.instruction.LoadInstruction;
 import java.lang.classfile.instruction.NewObjectInstruction;
+import java.lang.classfile.instruction.OperatorInstruction;
+import java.lang.classfile.instruction.StackInstruction;
 import java.lang.constant.ClassDesc;
-import java.net.URL;
+import java.lang.constant.MethodTypeDesc;
 import java.net.URLClassLoader;
 import java.nio.file.FileSystems;
-import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -69,20 +73,16 @@ import java.util.concurrent.ExecutorService;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import java.util.stream.Stream;
-import org.apache.maven.plugin.logging.Log;
 
 /**
  * Orchestrates the offline instrumentation of application bytecode.
  *
  * <p>Transforms "Call-Sites" of non-deterministic JDK APIs (like {@code new Socket()})
  * to redirect them to the deterministic simulator. During transformation, each class is
- * also scanned for OpenDST assertions via {@link PropertyDiscoverer}.
+ * also scanned for OpenDST assertions via {@link AssertionScanner}.
  */
 final class Instrumentation {
-    private final Path basePath;
-    private final Path instrumentedAppsDir;
     private final ExecutorService executor;
-    private final Log log;
 
     /** Result of a class transformation task. */
     private record TransformationResult(String name, byte[] content) {}
@@ -95,11 +95,8 @@ final class Instrumentation {
         }
     }
 
-    Instrumentation(Path basePath, Path instrumentedAppsDir, ExecutorService executor, Log log) {
-        this.basePath = basePath;
-        this.instrumentedAppsDir = instrumentedAppsDir;
+    Instrumentation(ExecutorService executor) {
         this.executor = executor;
-        this.log = log;
     }
 
     /** Creates a new thread-safe set for collecting discovered assertions. */
@@ -108,108 +105,44 @@ final class Instrumentation {
     }
 
     /**
-     * Instruments an exploded application directory (e.g., an unpacked WAR or artifact)
-     * and writes the instrumented output under {@code instrumentedAppsDir/<appName>/}.
+     * Rewrites an app's {@link Classpath}, emitting its instrumented content to {@code sink}: class
+     * directories are merged into {@code WEB-INF/classes/<name>} entries (resources copied verbatim), and
+     * each jar is rewritten in-memory into a single {@code WEB-INF/lib/<name>.jar} entry. {@return the
+     * assertions discovered}. The caller's {@code sink} decides where those entries land; this only rewrites
+     * bytecode — the shared {@code ClassHierarchyResolver} is built from the whole classpath, since a class
+     * may reference a type in one of the jars.
      *
-     * <p>The source directory is expected to contain a {@code WEB-INF/} layout with
-     * {@code classes/}, {@code lib/}, and optionally {@code fs/}.
-     *
-     * @param appName   the directory name under {@code apps/} in the output JAR
-     * @param sourceDir the exploded application directory to instrument
-     * @return a set of all OpenDST assertions discovered during instrumentation
-     * @throws IOException if instrumentation fails due to I/O errors
      * @throws AssertionValidationException if an assertion is invalid
      */
-    Set<Assertion> instrumentAppDir(String appName, Path sourceDir) throws IOException {
-        log.info("Instrumenting app directory '%s' from %s".formatted(appName, sourceDir));
+    Set<Assertion> instrument(Classpath sourceClasspath, EntrySink sink) throws IOException {
         var discovered = newAssertionSet();
-        createDirectories(instrumentedAppsDir);
-        var urls = collectClasspath(sourceDir, List.of());
-        try (var projectLoader = new URLClassLoader(urls, getClass().getClassLoader())) {
-            var classFile = newClassFile(projectLoader);
-            var outputDir = instrumentedAppsDir.resolve(appName);
-            instrumentApplicationDirectory(classFile, sourceDir, outputDir, discovered);
-        }
-        return discovered;
-    }
-
-    /**
-     * Instruments project classes and runtime dependency JARs, placing the output under
-     * {@code instrumentedAppsDir/<appName>/WEB-INF/}.
-     *
-     * <p>Used when the project does <em>not</em> use {@code maven-war-plugin}. The source
-     * directories are read but never modified; instrumented output is written entirely to
-     * {@code instrumentedAppsDir}.
-     *
-     * @param appName        the application name (typically the Maven artifactId), used as
-     *                       the directory name under {@code apps/} in the output JAR
-     * @param classesDirs    the directories containing class files to instrument (e.g.,
-     *                       {@code [target/classes]} for compile scope, or
-     *                       {@code [target/classes, target/test-classes]} for test scope);
-     *                       all directories are combined into a single {@code classes.jar}
-     * @param dependencyJars the project's dependency JARs to instrument and copy
-     * @return a set of all OpenDST assertions discovered during instrumentation
-     * @throws IOException if instrumentation fails due to I/O errors
-     * @throws AssertionValidationException if an assertion is invalid
-     */
-    Set<Assertion> instrumentClasses(String appName, List<Path> classesDirs, List<Path> dependencyJars)
-            throws IOException {
-        log.info("Instrumenting classes for %s".formatted(appName));
-        var discovered = newAssertionSet();
-        createDirectories(instrumentedAppsDir);
-        var urls = collectClasspath(null, dependencyJars);
-        try (var projectLoader = new URLClassLoader(urls, getClass().getClassLoader())) {
+        try (var projectLoader = sourceClasspath.newClassLoader(getClass().getClassLoader())) {
             var classFile = newClassFile(projectLoader);
 
-            // Instrument class directories → <appName>/WEB-INF/classes.jar
-            var webInfDir = instrumentedAppsDir.resolve(appName).resolve("WEB-INF");
-            instrumentClassesFolders(classFile, classesDirs, webInfDir.resolve("classes.jar"), discovered);
+            // Class directories merge into WEB-INF/classes/; instrumentEntries copies non-class resources verbatim.
+            EntrySink classesSink = (name, content) -> sink.put("WEB-INF/classes/" + name, content);
+            for (var classDir : sourceClasspath.classDirs()) {
+                if (!exists(classDir)) {
+                    continue;
+                }
+                try (var stream = walk(classDir)) {
+                    instrumentEntries(
+                            classFile, classesSink, discovered, classDir, stream.filter(Files::isRegularFile));
+                }
+            }
 
-            // Instrument runtime dependency JARs → <appName>/WEB-INF/lib/
-            var libDir = webInfDir.resolve("lib");
-            for (var jarPath : dependencyJars) {
-                var targetJar = libDir.resolve(jarPath.getFileName().toString());
-                createDirectories(libDir);
-                instrumentJar(classFile, jarPath, targetJar, discovered);
+            // Each jar is rewritten in-memory and emitted as one WEB-INF/lib/<name>.jar entry.
+            var libNames = new HashSet<String>();
+            for (var jar : sourceClasspath.jars()) {
+                var libEntry = "WEB-INF/lib/" + jar.getFileName();
+                if (!libNames.add(libEntry)) {
+                    throw new IOException(
+                            "Two dependency jars map to the same entry '" + libEntry + "'; rename one to disambiguate");
+                }
+                sink.put(libEntry, instrumentedJar(classFile, jar, discovered));
             }
         }
         return discovered;
-    }
-
-    /**
-     * Instruments an exploded application directory, walking its file tree to find
-     * {@code classes/} folders and JAR files.
-     */
-    private void instrumentApplicationDirectory(
-            ClassFile classFile, Path sourceDir, Path outputDir, Set<Assertion> discovered) throws IOException {
-        if (!exists(sourceDir)) {
-            return;
-        }
-
-        walkFileTree(sourceDir, new SimpleFileVisitor<>() {
-            @Override
-            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
-                if (dir.getFileName().toString().equals("classes") && !dir.equals(sourceDir)) {
-                    var targetJar = outputDir.resolve(sourceDir.relativize(dir) + ".jar");
-                    instrumentClassesFolder(classFile, dir, targetJar, discovered);
-                    return SKIP_SUBTREE;
-                }
-                return CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                var targetFile = outputDir.resolve(sourceDir.relativize(file));
-                createDirectories(targetFile.getParent());
-
-                if (file.getFileName().toString().endsWith(".jar")) {
-                    instrumentJar(classFile, file, targetFile, discovered);
-                } else {
-                    copy(file, targetFile, REPLACE_EXISTING);
-                }
-                return CONTINUE;
-            }
-        });
     }
 
     private static final ClassDesc VIRTUAL_THREAD_DESC = ClassDesc.ofDescriptor("Ljava/lang/VirtualThread;");
@@ -233,86 +166,42 @@ final class Instrumentation {
                     } else if ("Ljava/util/SimulatorTimer;".equals(desc.descriptorString())) {
                         return ClassHierarchyResolver.ClassHierarchyInfo.ofClass(TIMER_DESC);
                     } else {
+                        // Deliberate last resort: a type the app classpath can't resolve is assumed to extend
+                        // Object. The classpath spans the whole app, so this is rare; a genuinely missing
+                        // supertype would surface downstream as a VerifyError rather than here.
                         return ClassHierarchyResolver.ClassHierarchyInfo.ofClass(OBJECT_DESC);
                     }
                 })));
     }
 
-    /**
-     * Builds a classpath for the {@link URLClassLoader} used during transformation.
-     *
-     * @param appDir    an exploded application directory, or {@code null} for non-WAR projects
-     * @param extraJars additional JARs to include (e.g. runtime dependency JARs for JAR projects)
-     */
-    private URL[] collectClasspath(Path appDir, List<Path> extraJars) throws IOException {
-        var urls = new ArrayList<URL>();
-        var mainClassesDir = basePath.resolve("target/classes");
-        if (exists(mainClassesDir)) {
-            urls.add(mainClassesDir.toUri().toURL());
-        }
-        var testClassesDir = basePath.resolve("target/test-classes");
-        if (exists(testClassesDir)) {
-            urls.add(testClassesDir.toUri().toURL());
-        }
-        if (appDir != null && exists(appDir)) {
-            try (var stream = walk(appDir)) {
-                var paths = stream.filter(path -> (isDirectory(path)
-                                        && path.getFileName().toString().equals("classes"))
-                                || path.getFileName().toString().endsWith(".jar"))
-                        .toList();
-                for (var path : paths) {
-                    urls.add(path.toUri().toURL());
-                }
-            }
-        }
-        for (var jar : extraJars) {
-            urls.add(jar.toUri().toURL());
-        }
-        return urls.toArray(URL[]::new);
+    /** Where instrumented output goes — an entry in the opendst jar, a nested jar, a file in a directory. */
+    @FunctionalInterface
+    interface EntrySink {
+        /** Writes one entry (a {@code /}-separated relative name) with the given bytes. */
+        void put(String name, byte[] content) throws IOException;
     }
 
-    /** Instruments a directory of class files and bundles them into a JAR. */
-    private void instrumentClassesFolder(ClassFile classFile, Path sourceDir, Path targetJar, Set<Assertion> discovered)
-            throws IOException {
-        instrumentClassesFolders(classFile, List.of(sourceDir), targetJar, discovered);
-    }
-
-    /**
-     * Instruments one or more directories of class files and bundles them into a single JAR.
-     *
-     * <p>Directories that do not exist are silently skipped. If no directories contain any
-     * class files, the target JAR will be empty.
-     */
-    private void instrumentClassesFolders(
-            ClassFile classFile, List<Path> sourceDirs, Path targetJar, Set<Assertion> discovered) throws IOException {
-        createDirectories(targetJar.getParent());
-        try (var jos = new JarOutputStream(newOutputStream(targetJar))) {
-            for (var sourceDir : sourceDirs) {
-                if (!exists(sourceDir)) {
-                    continue;
-                }
-                try (var stream = walk(sourceDir)) {
-                    instrumentEntries(classFile, jos, discovered, sourceDir, stream.filter(Files::isRegularFile));
-                }
-            }
-        }
-    }
-
-    /** Instruments a JAR file and writes the result to a target location. */
-    private void instrumentJar(ClassFile classFile, Path jarPath, Path targetJar, Set<Assertion> discovered)
-            throws IOException {
+    /** Instruments a jar in-memory and {@return its bytes} — one {@code WEB-INF/lib/<name>.jar} entry. */
+    private byte[] instrumentedJar(ClassFile classFile, Path jarPath, Set<Assertion> discovered) throws IOException {
+        var bytes = new ByteArrayOutputStream();
         try (var fs = FileSystems.newFileSystem(jarPath, (ClassLoader) null);
-                var jos = new JarOutputStream(newOutputStream(targetJar))) {
+                var jos = new JarOutputStream(bytes)) {
+            EntrySink sink = (name, content) -> {
+                jos.putNextEntry(new JarEntry(name));
+                jos.write(content);
+                jos.closeEntry();
+            };
             var root = fs.getPath("/");
             try (var stream = walk(root)) {
-                instrumentEntries(classFile, jos, discovered, root, stream.filter(Files::isRegularFile));
+                instrumentEntries(classFile, sink, discovered, root, stream.filter(Files::isRegularFile));
             }
         }
+        return bytes.toByteArray();
     }
 
-    /** Core logic for instrumenting a stream of entries. */
+    /** Core logic for instrumenting a stream of entries into an {@link EntrySink}. */
     private void instrumentEntries(
-            ClassFile classFile, JarOutputStream jos, Set<Assertion> discovered, Path root, Stream<Path> entries)
+            ClassFile classFile, EntrySink sink, Set<Assertion> discovered, Path root, Stream<Path> entries)
             throws IOException {
         var completionService = new ExecutorCompletionService<TransformationResult>(executor);
         int classTasks = 0;
@@ -333,7 +222,7 @@ final class Instrumentation {
                 final var entryName = name;
                 completionService.submit(() -> {
                     var model = classFile.parse(readAllBytes(path));
-                    PropertyDiscoverer.discover(model, discovered);
+                    AssertionScanner.discover(model, discovered);
                     var superclass = model.superclass().orElse(null);
                     var transform = superclass != null && isDirectThreadSubclass(superclass.asInternalName())
                             ? threadSubclassTransform().andThen(callSiteTransformMethod())
@@ -341,19 +230,14 @@ final class Instrumentation {
                     return new TransformationResult(entryName, classFile.transformClass(model, transform));
                 });
             } else if (!name.isEmpty()) {
-                var newEntry = new JarEntry(name);
-                jos.putNextEntry(newEntry);
-                jos.write(readAllBytes(path));
-                jos.closeEntry();
+                sink.put(name, readAllBytes(path));
             }
         }
 
         for (int i = 0; i < classTasks; i++) {
             try {
                 var result = completionService.take().get();
-                jos.putNextEntry(new JarEntry(result.name()));
-                jos.write(result.content());
-                jos.closeEntry();
+                sink.put(result.name(), result.content());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while transforming entries in %s".formatted(root), e);
@@ -477,6 +361,250 @@ final class Instrumentation {
 
         private CallSiteTransform() {
             // Prevent instantiation
+        }
+    }
+
+    /**
+     * Scans class bytecode for OpenDST {@link com.pingidentity.opendst.sdk.Assert} calls and builds the
+     * static catalog of assertions.
+     *
+     * <p>OpenDST requires a complete, static catalog of all reachable assertions before any simulation
+     * begins, so the runner can track coverage and generate heatmaps accurately. To keep the catalog
+     * static, every {@link com.pingidentity.opendst.sdk.Assert} call's {@code message} argument must be a
+     * <b>string literal</b> — enforced here.
+     *
+     * <p>Nested in {@link Instrumentation} because that is its sole consumer: each class is scanned as it is
+     * transformed. It works by lightweight symbolic stack tracking per method, resolving the literal
+     * argument at each Assert call site.
+     */
+    static final class AssertionScanner {
+
+        private static final String ASSERT_OWNER = "com/pingidentity/opendst/sdk/Assert";
+
+        private AssertionScanner() {}
+
+        /**
+         * Scans a class model for OpenDST assertions and adds them to the given set.
+         *
+         * @throws AssertionValidationException if an assertion uses a non-literal label
+         */
+        static void discover(ClassModel model, Set<Assertion> discovered) {
+            try {
+                var className = model.thisClass().asInternalName().replace('/', '.');
+                for (var method : model.methods()) {
+                    var methodName = method.methodName().toString();
+                    for (var code : method.code().stream().toList()) {
+                        scanMethod(code, className, methodName, discovered);
+                    }
+                }
+            } catch (AssertionValidationException ave) {
+                throw ave;
+            } catch (Exception e) {
+                // Best effort discovery for application code. Don't crash on complex third-party bytecode.
+            }
+        }
+
+        private static void scanMethod(
+                Iterable<? extends CodeElement> code, String className, String methodName, Set<Assertion> discovered) {
+            // Symbolic stack tracking must be sequential per method to be correct.
+            var stack = new ArrayList<String>();
+            int currentLine = -1;
+            for (var element : code) {
+                switch (element) {
+                    case LineNumber ln -> currentLine = ln.line();
+                    case ConstantInstruction ci -> {
+                        var val = ci.constantValue();
+                        stack.add(val instanceof String s ? s : "");
+                    }
+                    case InvokeInstruction inv -> {
+                        if (inv.method().owner().asInternalName().equals(ASSERT_OWNER)) {
+                            handleAssertCall(inv, stack, className, methodName, currentLine, discovered);
+                        }
+                        updateStackForInvoke(inv, stack);
+                    }
+                    case LoadInstruction _ -> stack.add(null);
+                    case FieldInstruction fi -> updateStackForField(fi, stack);
+                    case OperatorInstruction oi -> {
+                        int pop = getOperatorPopCount(oi.opcode());
+                        for (int k = 0; k < pop && !stack.isEmpty(); k++) {
+                            stack.removeLast();
+                        }
+                        stack.add(null);
+                    }
+                    case StackInstruction si -> handleStackInstruction(si, stack);
+                    case Instruction instr -> {
+                        var opcode = instr.opcode();
+                        if (opcode == Opcode.NEW) {
+                            stack.add(null);
+                        } else if (opcode == Opcode.INSTANCEOF || opcode == Opcode.ARRAYLENGTH) {
+                            // Pop one, push one (net zero but replace top with non-string)
+                            if (!stack.isEmpty()) {
+                                stack.removeLast();
+                            }
+                            stack.add(null);
+                        } else if (opcode.name().contains("ALOAD")
+                                || opcode.name().contains("ASTORE")) {
+                            stack.clear(); // Conservatively clear on complex array operations
+                        }
+                    }
+                    default -> {}
+                }
+            }
+        }
+
+        private static void handleAssertCall(
+                InvokeInstruction inv,
+                List<String> stack,
+                String className,
+                String methodName,
+                int line,
+                Set<Assertion> discovered) {
+            var name = inv.method().name().toString();
+            var type = inv.typeSymbol();
+            var params = type.parameterList();
+            int pos = 0;
+            for (int i = params.size() - 1; i >= 0; i--) {
+                pos += TypeKind.from(params.get(i)).slotSize();
+                if (params.get(i).descriptorString().equals("Ljava/lang/String;")) {
+                    break;
+                }
+            }
+
+            String message = null;
+            if (stack.size() >= pos) {
+                message = stack.get(stack.size() - pos);
+            }
+
+            if (message == null || message.isEmpty()) {
+                throw new AssertionValidationException(
+                        "Invalid OpenDST assertion in %s.%s (line %d): message must be a string literal for Assert.%s%s"
+                                .formatted(className, methodName, line, name, type.displayDescriptor()));
+            }
+            var kind = name.startsWith("sometimes") || name.equals("reachable") ? SOMETIMES : ALWAYS;
+            discovered.add(new Assertion(kind, message, className, line));
+        }
+
+        private static void updateStackForInvoke(InvokeInstruction inv, List<String> stack) {
+            int pop = getPopCount(inv.typeSymbol(), inv.opcode() != Opcode.INVOKESTATIC);
+            for (int k = 0; k < pop && !stack.isEmpty(); k++) {
+                stack.removeLast();
+            }
+            int push = TypeKind.from(inv.typeSymbol().returnType()).slotSize();
+            for (int k = 0; k < push; k++) {
+                stack.add(null);
+            }
+        }
+
+        private static void updateStackForField(FieldInstruction fi, List<String> stack) {
+            boolean isPut = fi.opcode() == Opcode.PUTFIELD || fi.opcode() == Opcode.PUTSTATIC;
+            boolean isStatic = fi.opcode() == Opcode.GETSTATIC || fi.opcode() == Opcode.PUTSTATIC;
+            int slots = TypeKind.from(fi.typeSymbol()).slotSize();
+            if (isPut) {
+                int pop = slots + (isStatic ? 0 : 1);
+                for (int k = 0; k < pop && !stack.isEmpty(); k++) {
+                    stack.removeLast();
+                }
+            } else {
+                if (!isStatic && !stack.isEmpty()) {
+                    stack.removeLast();
+                }
+                for (int k = 0; k < slots; k++) {
+                    stack.add(null);
+                }
+            }
+        }
+
+        /** Calculates how many stack slots an invocation pops. */
+        private static int getPopCount(MethodTypeDesc type, boolean hasReceiver) {
+            int count = hasReceiver ? 1 : 0;
+            for (var arg : type.parameterList()) {
+                count += TypeKind.from(arg).slotSize();
+            }
+            return count;
+        }
+
+        /** Returns the number of stack slots popped by an operator instruction. */
+        private static int getOperatorPopCount(Opcode opcode) {
+            return switch (opcode) {
+                case INEG,
+                        LNEG,
+                        FNEG,
+                        DNEG,
+                        I2L,
+                        I2F,
+                        I2D,
+                        L2I,
+                        L2F,
+                        L2D,
+                        F2I,
+                        F2L,
+                        F2D,
+                        D2I,
+                        D2L,
+                        D2F,
+                        I2B,
+                        I2C,
+                        I2S -> 1;
+                default -> 2;
+            };
+        }
+
+        /** Simulates stack manipulation instructions (DUP, SWAP, etc.) on the symbolic stack. */
+        private static void handleStackInstruction(StackInstruction si, List<String> stack) {
+            if (stack.isEmpty()) {
+                return;
+            }
+            switch (si.opcode()) {
+                case POP -> stack.removeLast();
+                case POP2 -> {
+                    stack.removeLast();
+                    if (!stack.isEmpty()) {
+                        stack.removeLast();
+                    }
+                }
+                case DUP -> stack.add(stack.getLast());
+                case DUP_X1 -> {
+                    if (stack.size() < 2) {
+                        return;
+                    }
+                    var top = stack.removeLast();
+                    var next = stack.removeLast();
+                    stack.add(top);
+                    stack.add(next);
+                    stack.add(top);
+                }
+                case DUP_X2 -> {
+                    if (stack.size() < 3) {
+                        return;
+                    }
+                    var top = stack.removeLast();
+                    var n1 = stack.removeLast();
+                    var n2 = stack.removeLast();
+                    stack.add(top);
+                    stack.add(n2);
+                    stack.add(n1);
+                    stack.add(top);
+                }
+                case DUP2 -> {
+                    if (stack.size() < 2) {
+                        return;
+                    }
+                    var v1 = stack.getLast();
+                    var v2 = stack.get(stack.size() - 2);
+                    stack.add(v2);
+                    stack.add(v1);
+                }
+                case SWAP -> {
+                    if (stack.size() < 2) {
+                        return;
+                    }
+                    var v1 = stack.removeLast();
+                    var v2 = stack.removeLast();
+                    stack.add(v1);
+                    stack.add(v2);
+                }
+                default -> {}
+            }
         }
     }
 }

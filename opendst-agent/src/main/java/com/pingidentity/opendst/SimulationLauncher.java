@@ -102,8 +102,8 @@ public final class SimulationLauncher {
     /**
      * Builds a {@link URLClassLoader} for a node whose classes live under {@code appDir/WEB-INF/}.
      *
-     * <p>Walks {@code WEB-INF/lib/} for JARs, then checks for {@code WEB-INF/classes.jar} and {@code WEB-INF/classes
-     * /}. Any additional URLs (e.g. the opendst-agent JAR) are appended after the application classpath.
+     * <p>Walks {@code WEB-INF/lib/} for JARs, then adds {@code WEB-INF/classes/}. Any additional URLs
+     * (e.g. the opendst-agent JAR) are appended after the application classpath.
      *
      * @param name      the classloader name (used for debugging)
      * @param appDir    the application directory (contains {@code WEB-INF/})
@@ -128,11 +128,6 @@ public final class SimulationLauncher {
                     });
         } catch (NoSuchFileException e) {
             // No lib directory — that's fine
-        }
-        // WEB-INF/classes.jar
-        var classesJar = webInfDir.resolve("classes.jar");
-        if (exists(classesJar)) {
-            urls.add(classesJar.toUri().toURL());
         }
         // WEB-INF/classes/
         var classesDir = webInfDir.resolve("classes");

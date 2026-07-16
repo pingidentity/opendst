@@ -56,6 +56,30 @@
                     <execution>
                         <goals><goal>build</goal></goals>
                         <configuration>
+                            <deployment>
+                                <services>
+                                    <service>
+                                        <name>server</name>
+                                        <className>com.pingidentity.opendst.it.networkfault.NetworkFaultApp$Server</className>
+                                        <ip>10.0.0.1</ip>
+                                        <args>
+                                            <arg>8080</arg>
+                                        </args>
+                                    </service>
+                                    <service>
+                                        <name>client</name>
+                                        <className>com.pingidentity.opendst.it.networkfault.NetworkFaultApp$Client</className>
+                                        <ip>10.0.0.2</ip>
+                                        <args>
+                                            <arg>10.0.0.1</arg>
+                                            <arg>8080</arg>
+                                        </args>
+                                    </service>
+                                </services>
+                                <traceAuditor>
+                                    <className>com.pingidentity.opendst.it.networkfault.NetworkFaultTraceAuditor</className>
+                                </traceAuditor>
+                            </deployment>
                             <jvmArguments>-XX:TieredStopAtLevel=1 -Xms64m -Xmx64m</jvmArguments>
                         </configuration>
                     </execution>

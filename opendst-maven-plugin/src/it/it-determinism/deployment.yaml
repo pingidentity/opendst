@@ -1,9 +1,0 @@
-services:
-  server:
-    class: com.pingidentity.opendst.it.replaytest.EchoApp$Server
-    ip: 10.0.0.1
-    args: ["8080"]
-  client:
-    class: com.pingidentity.opendst.it.replaytest.EchoApp$Client
-    ip: 10.0.0.2
-    args: ["10.0.0.1", "8080"]

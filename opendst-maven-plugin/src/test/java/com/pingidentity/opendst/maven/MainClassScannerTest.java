@@ -15,19 +15,29 @@
  */
 package com.pingidentity.opendst.maven;
 
-import static com.pingidentity.opendst.maven.MainClassScanner.toHostname;
+import static com.pingidentity.opendst.maven.BuildMojo.MainClassScanner.toHostname;
+import static dev.hegel.Generators.booleans;
+import static dev.hegel.Generators.sampledFrom;
 import static java.util.Locale.ROOT;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import dev.hegel.HegelTest;
+import dev.hegel.TestCase;
 import java.util.Map;
-import java.util.Random;
+import org.junit.jupiter.api.Test;
 
-/**
- * Surefire POJO tests for {@link MainClassScanner}.
- * Discovered by naming convention; no JUnit/TestNG required.
- */
+/** Tests for {@link BuildMojo.MainClassScanner}. */
 public class MainClassScannerTest {
 
-    public void testToHostname() {
+    /** Class-name fragments covering what {@code toHostname} branches on: acronym runs, digits, single letters. */
+    private static final String[] WORDS = {
+        "My", "Server", "Foo", "App", "Client", "DST", "HTTP", "Http2", "Node9", "A", "AB", "X"
+    };
+
+    @Test
+    public void mapsKnownClassNamesToHostnames() {
         Map<String, String> cases = Map.of(
                 "App", "app",
                 "EasyApp", "easy-app",
@@ -39,102 +49,35 @@ public class MainClassScannerTest {
                 "DST", "dst",
                 "Http2Client", "http2-client",
                 "My_Server", "my.server");
-
-        var failures = new StringBuilder();
-        for (var entry : cases.entrySet()) {
-            var result = toHostname(entry.getKey());
-            if (!result.equals(entry.getValue())) {
-                failures.append("\n  toHostname(\"")
-                        .append(entry.getKey())
-                        .append("\") = \"")
-                        .append(result)
-                        .append("\", expected \"")
-                        .append(entry.getValue())
-                        .append('"');
-            }
-        }
-
-        if (!failures.isEmpty()) {
-            throw new AssertionError("toHostname failures:" + failures);
-        }
-    }
-
-    public void testToHostnameProperties() {
-        // Fixed seed for reproducibility; 10 000 trials gives good coverage of the input space.
-        var rng = new Random(42L);
-        var failures = new StringBuilder();
-
-        for (int t = 0; t < 10_000; t++) {
-            var name = generateClassName(rng);
-            var result = toHostname(name);
-
-            // Property 1: output contains only lowercase letters and hyphens.
-            if (!result.equals(result.toLowerCase(ROOT))) {
-                failures.append("\n  [")
-                        .append(name)
-                        .append("] output has uppercase: ")
-                        .append(result);
-            }
-
-            // Property 2: no leading or trailing hyphen.
-            if (result.startsWith("-") || result.endsWith("-")) {
-                failures.append("\n  [")
-                        .append(name)
-                        .append("] leading/trailing hyphen: ")
-                        .append(result);
-            }
-
-            // Property 3: characters are preserved — removing separators and mapping '.' back to '_'
-            //             gives the lowercased input.
-            if (!result.replace("-", "").replace(".", "_").equals(name.toLowerCase(ROOT))) {
-                failures.append("\n  [")
-                        .append(name)
-                        .append("] character mismatch: ")
-                        .append(result);
-            }
-
-            // Property 4: output is a sequence of alphanumeric segments separated by '-' or '.',
-            //             i.e. [a-z0-9]+([.-][a-z0-9]+)* — no empty segments, no consecutive separators.
-            if (!result.matches("[a-z0-9]+([.\\-][a-z0-9]+)*")) {
-                failures.append("\n  [")
-                        .append(name)
-                        .append("] malformed output: ")
-                        .append(result);
-            }
-        }
-
-        if (!failures.isEmpty()) {
-            throw new AssertionError("Property violations over 10 000 trials:" + failures);
-        }
+        cases.forEach((in, expected) -> assertEquals(expected, toHostname(in), in));
     }
 
     /**
-     * Generates a Java-like simple class name: 1–4 words, each starting with one or more
-     * uppercase letters (acronym run), followed by a lowercase/digit tail. Words are occasionally
-     * separated by underscores (subdomain boundary) instead of being concatenated directly.
+     * Properties of {@link BuildMojo.MainClassScanner#toHostname} over generated Java-like class names — a
+     * first {@link #WORDS word} followed by more words, each either concatenated ({@code MyServer}) or
+     * underscore-separated ({@code My_Server}). hegel replaces the previous hand-rolled {@code Random}
+     * generator (and shrinks failures to a minimal name).
      */
-    private static String generateClassName(Random rng) {
-        int words = 1 + rng.nextInt(4);
-        var sb = new StringBuilder();
-        for (int w = 0; w < words; w++) {
-            if (w > 0 && rng.nextInt(6) == 0) {
+    @HegelTest
+    void toHostnameIsWellFormedAndLossless(TestCase tc) {
+        var sb = new StringBuilder(tc.draw(sampledFrom(WORDS), "word0"));
+        int extra = tc.draw(sampledFrom(0, 1, 2, 3), "extraWords");
+        for (int i = 0; i < extra; i++) {
+            if (tc.draw(booleans(), "underscore" + i)) {
                 sb.append('_');
             }
-            // Uppercase run: 1 letter most of the time, occasionally an acronym (2–4 letters).
-            int upperRun = rng.nextBoolean() ? 1 : 1 + rng.nextInt(3);
-            for (int u = 0; u < upperRun; u++) {
-                sb.append((char) ('A' + rng.nextInt(26)));
-            }
-            // Lowercase/digit tail.
-            int tail = rng.nextInt(7);
-            for (int i = 0; i < tail; i++) {
-                if (rng.nextInt(8) == 0) {
-                    sb.append((char) ('0' + rng.nextInt(10)));
-                } else {
-                    sb.append((char) ('a' + rng.nextInt(26)));
-                }
-            }
+            sb.append(tc.draw(sampledFrom(WORDS), "word" + (i + 1)));
         }
-        return sb.toString();
+        var name = sb.toString();
+        var result = toHostname(name);
+
+        // Lowercase only.
+        assertEquals(result.toLowerCase(ROOT), result, name);
+        // No leading or trailing separator.
+        assertFalse(result.startsWith("-") || result.endsWith("-"), () -> name + " -> " + result);
+        // Character-preserving: stripping separators and mapping '.' back to '_' recovers the lowercased input.
+        assertEquals(name.toLowerCase(ROOT), result.replace("-", "").replace(".", "_"), name);
+        // Well-formed: alphanumeric segments separated by single '-' or '.' — no empty or consecutive separators.
+        assertTrue(result.matches("[a-z0-9]+([.\\-][a-z0-9]+)*"), () -> name + " -> " + result);
     }
 }
