@@ -80,3 +80,6 @@ build_warnings.log
 **/PCheckerOutput/
 **/PGenerated/
 **/output/CSharp/
+
+#--- hegel property-based testing (local example database) ---
+.hegel/

@@ -29,6 +29,21 @@
                     <execution>
                         <goals><goal>build</goal></goals>
                         <configuration>
+                            <deployment>
+                                <services>
+                                    <service>
+                                        <name>app</name>
+                                        <className>com.pingidentity.opendst.it.instrumentation.RxApp</className>
+                                        <ip>10.0.0.1</ip>
+                                    </service>
+                                    <service>
+                                        <name>test-app</name>
+                                        <className>com.pingidentity.opendst.it.instrumentation.RxTestApp</className>
+                                        <ip>10.0.0.2</ip>
+                                        <scope>test</scope>
+                                    </service>
+                                </services>
+                            </deployment>
                             <jvmArguments>-XX:TieredStopAtLevel=1 -Xms64m -Xmx64m</jvmArguments>
                         </configuration>
                     </execution>

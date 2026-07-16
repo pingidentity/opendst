@@ -1,4 +1,0 @@
-services:
-  node:
-    class: com.pingidentity.opendst.it.flakytest.FlakyDST
-    ip: 10.0.0.2

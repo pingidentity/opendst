@@ -10,14 +10,14 @@
 //    incorrect merge types and the JVM throws a VerifyError at runtime.
 //
 // 2. Test scope: instrumentClasses() with [target/classes, target/test-classes] —
-//    both main and test classes are combined into a single classes.jar, with all
-//    dependency JARs (including test-scoped ones) instrumented alongside.
+//    both main and test classes are combined into a single WEB-INF/classes/ directory,
+//    with all dependency JARs (including test-scoped ones) instrumented alongside.
 //
 // We verify:
 //   a) The instrumented RxJava JAR passes verification (RxThreadFactory loads
 //      without VerifyError — the ClassHierarchyResolver correctly resolved
 //      RxCustomThread as a Thread subclass).
-//   b) The instrumented classes.jar contains the call-site transform: RxApp's
+//   b) The instrumented WEB-INF/classes/ contains the call-site transform: RxApp's
 //      createThread(Runnable) method has been rewritten from
 //      NEW Thread / INVOKESPECIAL Thread.<init> to
 //      NEW SimulatorThread / INVOKESPECIAL SimulatorThread.<init>.
@@ -56,7 +56,24 @@ check(jarFile.length() > 0, "${jarFile.name} is empty", logFile)
 // Compile-scope image verification (apps/it-instrumentation/)
 // ──────────────────────────────────────────────────────────────────────────────
 
-def instrumentedAppsDir = new File(targetDir, "opendst-package/instrumented-apps")
+// The instrumented apps are streamed straight into the -opendst.jar (no on-disk staging tree), so
+// extract the jar's apps/ subtree to a temp dir to inspect it. Extracting the nested WEB-INF/lib/*.jar
+// as real files also proves they were streamed in intact (not corrupt).
+def instrumentedAppsDir = new File(targetDir, "extracted-apps")
+instrumentedAppsDir.deleteDir()
+instrumentedAppsDir.mkdirs()
+def appsZip = new java.util.zip.ZipFile(jarFile)
+try {
+    appsZip.entries().each { entry ->
+        if (entry.name.startsWith("apps/") && !entry.isDirectory()) {
+            def out = new File(instrumentedAppsDir, entry.name.substring("apps/".length()))
+            out.parentFile.mkdirs()
+            appsZip.getInputStream(entry).withStream { is -> out.withOutputStream { os -> os << is } }
+        }
+    }
+} finally {
+    appsZip.close()
+}
 
 // Locate the instrumented RxJava JAR inside the compile-scope image
 def compileRxJava = new File(instrumentedAppsDir, "it-instrumentation/WEB-INF/lib/rxjava-3.1.10.jar")
@@ -64,22 +81,34 @@ check(compileRxJava.exists(), "Compile-scope: instrumented rxjava JAR not found 
 
 def reactiveStreams = new File(instrumentedAppsDir, "it-instrumentation/WEB-INF/lib/reactive-streams-1.0.4.jar")
 
-// The agent JAR is needed on the classpath because instrumented code references
-// SimulatorThread (the deterministic Thread base class)
-def agentJar = new File(targetDir, "opendst-package/opendst-agent.jar")
-check(agentJar.exists(), "Agent JAR not found at: ${agentJar}", logFile)
-
-// The patch-module JAR provides SimulatorThread (extends VirtualThread) for
-// Thread subclass rewriting. Instrumented Thread subclasses extend SimulatorThread
-// instead of Thread, so this JAR must be present via --patch-module java.base=...
-def patchModuleJar = new File(targetDir, "opendst-package/opendst-patch.jar")
-check(patchModuleJar.exists(), "opendst-patch.jar not found at: ${patchModuleJar}", logFile)
+// The runtime jars are written straight into the -opendst.jar's system/ (no on-disk staging), so extract
+// the two this IT needs. The agent JAR is needed on the classpath because instrumented code references
+// SimulatorThread (the deterministic Thread base class); the patch-module JAR provides SimulatorThread
+// (extends VirtualThread) for Thread subclass rewriting — instrumented Thread subclasses extend
+// SimulatorThread instead of Thread, so it must be present via --patch-module java.base=...
+def systemDir = new File(targetDir, "extracted-system")
+systemDir.deleteDir()
+systemDir.mkdirs()
+def sysZip = new java.util.zip.ZipFile(jarFile)
+try {
+    ["system/opendst-agent.jar", "system/opendst-patch.jar"].each { name ->
+        def entry = sysZip.getEntry(name)
+        check(entry != null, "${name} not found in ${jarFile.name}", logFile)
+        def out = new File(systemDir, name.substring("system/".length()))
+        sysZip.getInputStream(entry).withStream { is -> out.withOutputStream { os -> os << is } }
+    }
+} finally {
+    sysZip.close()
+}
+def agentJar = new File(systemDir, "opendst-agent.jar")
+def patchModuleJar = new File(systemDir, "opendst-patch.jar")
 def patchModuleArg = "--patch-module"
 def patchModuleVal = "java.base=${patchModuleJar.absolutePath}"
 
-// Locate the instrumented classes.jar for the compile-scope image
-def compileClassesJar = new File(instrumentedAppsDir, "it-instrumentation/WEB-INF/classes.jar")
-check(compileClassesJar.exists(), "Compile-scope: classes.jar not found at: ${compileClassesJar}", logFile)
+// Locate the instrumented classes directory for the compile-scope image
+def compileClassesDir = new File(instrumentedAppsDir, "it-instrumentation/WEB-INF/classes")
+def compileRxAppClass = new File(compileClassesDir, "com/pingidentity/opendst/it/instrumentation/RxApp.class")
+check(compileRxAppClass.exists(), "Compile-scope: RxApp.class not found at: ${compileRxAppClass}", logFile)
 
 def javaHome = System.getProperty("java.home")
 def javaBin = new File(javaHome, "bin/java").absolutePath
@@ -142,14 +171,14 @@ check(runOutput.contains("OK:"),
 
 println "Compile-scope: RxJava stack map verification passed."
 
-// ── Part 2: Verify call-site transform in classes.jar (bytecode) ────────────
+// ── Part 2: Verify call-site transform in WEB-INF/classes/ (bytecode) ────────
 
 // Use javap to disassemble the instrumented RxApp.createThread method and verify
 // that "new Thread" + "invokespecial Thread.<init>" has been replaced with
 // "new SimulatorThread" + "invokespecial SimulatorThread.<init>"
-println "Inspecting instrumented bytecode in classes.jar..."
+println "Inspecting instrumented bytecode in WEB-INF/classes/..."
 def javapProc = new ProcessBuilder(
-        javapBin, "-c", "-cp", compileClassesJar.absolutePath,
+        javapBin, "-c", "-cp", compileClassesDir.absolutePath,
         "com.pingidentity.opendst.it.instrumentation.RxApp")
         .redirectErrorStream(true)
         .start()
@@ -182,20 +211,14 @@ println "Compile-scope: call-site transform verification passed."
 def testScopeDir = new File(instrumentedAppsDir, "it-instrumentation-tests")
 check(testScopeDir.exists(), "Test-scope image directory not found: ${testScopeDir}", logFile)
 
-// classes.jar should contain both main and test classes
-def testClassesJar = new File(testScopeDir, "WEB-INF/classes.jar")
-check(testClassesJar.exists(), "Test-scope: classes.jar not found at: ${testClassesJar}", logFile)
-
-// Verify classes.jar contains both RxApp (main) and RxTestApp (test)
-List classesJarEntries
-try (def testScopeJar = new java.util.jar.JarFile(testClassesJar)) {
-    classesJarEntries = testScopeJar.entries().toList()*.name
-}
-def hasRxApp = classesJarEntries.any { it.contains("RxApp.class") && !it.contains("RxTestApp") }
-def hasRxTestApp = classesJarEntries.any { it.contains("RxTestApp.class") }
-check(hasRxApp, "Test-scope: classes.jar does not contain RxApp (main class).\nEntries: ${classesJarEntries}", logFile)
-check(hasRxTestApp, "Test-scope: classes.jar does not contain RxTestApp (test class).\nEntries: ${classesJarEntries}", logFile)
-println "Test-scope classes.jar contains both RxApp and RxTestApp."
+// WEB-INF/classes/ should contain both main and test classes
+def testClassesDir = new File(testScopeDir, "WEB-INF/classes")
+def pkgPath = "com/pingidentity/opendst/it/instrumentation"
+def testRxApp = new File(testClassesDir, "${pkgPath}/RxApp.class")
+def testRxTestApp = new File(testClassesDir, "${pkgPath}/RxTestApp.class")
+check(testRxApp.exists(), "Test-scope: RxApp.class (main) not found at: ${testRxApp}", logFile)
+check(testRxTestApp.exists(), "Test-scope: RxTestApp.class (test) not found at: ${testRxTestApp}", logFile)
+println "Test-scope WEB-INF/classes/ contains both RxApp and RxTestApp."
 
 // Test-scope image should also have instrumented RxJava
 def testRxJava = new File(testScopeDir, "WEB-INF/lib/rxjava-3.1.10.jar")
@@ -239,10 +262,10 @@ check(runOutput2.contains("OK:"),
 
 println "Test-scope: RxJava stack map verification passed."
 
-// Verify call-site transform in test-scope classes.jar too
-println "Inspecting instrumented bytecode in test-scope classes.jar..."
+// Verify call-site transform in test-scope WEB-INF/classes/ too
+println "Inspecting instrumented bytecode in test-scope WEB-INF/classes/..."
 def javapProc2 = new ProcessBuilder(
-        javapBin, "-c", "-cp", testClassesJar.absolutePath,
+        javapBin, "-c", "-cp", testClassesDir.absolutePath,
         "com.pingidentity.opendst.it.instrumentation.RxApp")
         .redirectErrorStream(true)
         .start()
@@ -251,17 +274,8 @@ def javapExit2 = javapProc2.waitFor()
 check(javapExit2 == 0, "Test-scope: javap failed: ${javapOutput2}", logFile)
 
 check(javapOutput2.contains("SimulatorThread"),
-      "Test-scope: call-site transform NOT applied in classes.jar.\njavap output:\n${javapOutput2}", logFile)
+      "Test-scope: call-site transform NOT applied in WEB-INF/classes/.\njavap output:\n${javapOutput2}", logFile)
 
 println "Test-scope: call-site transform verification passed."
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Verify old test-classes.jar no longer exists (dead code removed)
-// ──────────────────────────────────────────────────────────────────────────────
-
-def oldTestClassesJar = new File(instrumentedAppsDir, "test-classes.jar")
-check(!oldTestClassesJar.exists(),
-      "Old test-classes.jar still exists at ${oldTestClassesJar} — instrumentTestClasses() should have been removed",
-      logFile)
 
 println "All verifications passed — both compile-scope and test-scope images are correct."

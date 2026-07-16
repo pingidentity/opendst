@@ -47,6 +47,33 @@
                     <execution>
                         <goals><goal>build</goal></goals>
                         <configuration>
+                            <deployment>
+                                <services>
+                                    <service>
+                                        <name>server</name>
+                                        <className>com.pingidentity.opendst.testapp.SecretSequenceApp$Server</className>
+                                        <ip>10.0.0.2</ip>
+                                        <dir>target/apps/it-core</dir>
+                                        <args>
+                                            <arg>8080</arg>
+                                        </args>
+                                    </service>
+                                    <service>
+                                        <name>client</name>
+                                        <className>com.pingidentity.opendst.testapp.SecretSequenceApp$Client</className>
+                                        <ip>10.0.0.3</ip>
+                                        <dir>target/apps/it-core</dir>
+                                        <args>
+                                            <arg>10.0.0.2</arg>
+                                            <arg>8080</arg>
+                                        </args>
+                                    </service>
+                                </services>
+                                <traceAuditor>
+                                    <className>com.pingidentity.opendst.testapp.SecretSequenceTraceAuditor</className>
+                                    <dir>target/apps/it-core</dir>
+                                </traceAuditor>
+                            </deployment>
                             <jvmArguments>-XX:TieredStopAtLevel=1 -Xms64m -Xmx64m</jvmArguments>
                         </configuration>
                     </execution>

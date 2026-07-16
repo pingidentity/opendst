@@ -28,6 +28,37 @@
                 <executions>
                     <execution>
                         <goals><goal>build</goal></goals>
+                        <configuration>
+                            <deployment>
+                                <services>
+                                    <service>
+                                        <name>app</name>
+                                        <className>com.pingidentity.opendst.it.validassertion.ValidAssertionApp</className>
+                                        <ip>10.0.0.1</ip>
+                                    </service>
+                                    <service>
+                                        <name>always-never-hit</name>
+                                        <className>com.pingidentity.opendst.it.AlwaysNeverHitApp</className>
+                                        <ip>10.0.0.2</ip>
+                                    </service>
+                                    <service>
+                                        <name>comparative</name>
+                                        <className>com.pingidentity.opendst.it.ComparativeAssertionApp</className>
+                                        <ip>10.0.0.3</ip>
+                                    </service>
+                                    <service>
+                                        <name>liveness-violation</name>
+                                        <className>com.pingidentity.opendst.it.LivenessViolationApp</className>
+                                        <ip>10.0.0.4</ip>
+                                    </service>
+                                    <service>
+                                        <name>sometimes-satisfied</name>
+                                        <className>com.pingidentity.opendst.it.SometimesSatisfiedApp</className>
+                                        <ip>10.0.0.5</ip>
+                                    </service>
+                                </services>
+                            </deployment>
+                        </configuration>
                     </execution>
                 </executions>
             </plugin>

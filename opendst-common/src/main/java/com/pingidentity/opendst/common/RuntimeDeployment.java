@@ -31,8 +31,9 @@ import java.util.Map;
  * <p>The wire format is plain JSON (no annotations, no polymorphism) so it can be parsed by {@code jackson-jr} on
  * the child side without dragging {@code jackson-databind} or {@code jackson-yaml} into the agent JAR.
  *
- * <p>The build plugin produces this from an enriched {@code DeploymentDescriptor} where every service's source has
- * been resolved to a {@code Source.Dir} pointing at an {@code apps/} subdirectory.
+ * <p>The build plugin produces this from its own deployment model once every service has been instrumented:
+ * where the bytecode originally came from is a build-time concern, and does not survive into the JAR — only the
+ * {@code apps/} subdirectory it was written to.
  */
 public record RuntimeDeployment(
         String jvmArguments, Map<String, RuntimeService> services, RuntimeAuditor traceAuditor) {

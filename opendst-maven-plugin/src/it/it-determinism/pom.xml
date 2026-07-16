@@ -29,6 +29,27 @@
                     <execution>
                         <goals><goal>build</goal></goals>
                         <configuration>
+                            <deployment>
+                                <services>
+                                    <service>
+                                        <name>server</name>
+                                        <className>com.pingidentity.opendst.it.replaytest.EchoApp$Server</className>
+                                        <ip>10.0.0.1</ip>
+                                        <args>
+                                            <arg>8080</arg>
+                                        </args>
+                                    </service>
+                                    <service>
+                                        <name>client</name>
+                                        <className>com.pingidentity.opendst.it.replaytest.EchoApp$Client</className>
+                                        <ip>10.0.0.2</ip>
+                                        <args>
+                                            <arg>10.0.0.1</arg>
+                                            <arg>8080</arg>
+                                        </args>
+                                    </service>
+                                </services>
+                            </deployment>
                             <jvmArguments>-XX:TieredStopAtLevel=1 -Xms64m -Xmx64m</jvmArguments>
                         </configuration>
                     </execution>

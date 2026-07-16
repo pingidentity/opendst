@@ -15,49 +15,38 @@
  */
 package com.pingidentity.opendst.maven;
 
-import static com.pingidentity.opendst.maven.DeploymentDescriptor.PROJECT_ARTIFACT_ID_KEY;
-import static com.pingidentity.opendst.maven.DeploymentDescriptor.Source.Project.Scope.TEST;
+import static java.lang.Character.isDigit;
+import static java.lang.Character.isLowerCase;
+import static java.lang.Character.isUpperCase;
+import static java.lang.Character.toLowerCase;
 import static java.lang.Runtime.getRuntime;
-import static java.nio.file.FileSystems.newFileSystem;
-import static java.nio.file.Files.copy;
-import static java.nio.file.Files.createDirectories;
-import static java.nio.file.Files.delete;
-import static java.nio.file.Files.exists;
-import static java.nio.file.Files.isDirectory;
-import static java.nio.file.Files.newOutputStream;
+import static java.lang.constant.ConstantDescs.CD_String;
+import static java.lang.constant.ConstantDescs.CD_void;
 import static java.nio.file.Files.readAllBytes;
 import static java.nio.file.Files.walk;
-import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
+import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.Executors.newFixedThreadPool;
-import static tools.jackson.core.StreamReadFeature.AUTO_CLOSE_SOURCE;
-import static tools.jackson.databind.DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES;
-import static tools.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS;
-import static tools.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES;
-import static tools.jackson.databind.cfg.EnumFeature.WRITE_ENUMS_USING_TO_STRING;
 
-import com.pingidentity.opendst.common.Assertion;
 import com.pingidentity.opendst.common.RuntimeDeployment;
 import com.pingidentity.opendst.common.RuntimeDeployment.RuntimeAuditor;
 import com.pingidentity.opendst.common.RuntimeDeployment.RuntimeService;
-import com.pingidentity.opendst.maven.DeploymentDescriptor.ServiceDescriptor;
-import com.pingidentity.opendst.maven.DeploymentDescriptor.Source;
-import com.pingidentity.opendst.maven.DeploymentDescriptor.Source.Project.Scope;
-import com.pingidentity.opendst.maven.DeploymentDescriptor.TraceAuditorDescriptor;
+import com.pingidentity.opendst.maven.BuildMojo.DeploymentConfiguration.SourceConfiguration;
+import com.pingidentity.opendst.maven.ClasspathResolver.Classpath;
+import com.pingidentity.opendst.maven.Instrumentation.AssertionValidationException;
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
+import java.lang.classfile.ClassFile;
+import java.lang.classfile.ClassModel;
+import java.lang.constant.MethodTypeDesc;
+import java.lang.reflect.AccessFlag;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Set;
-import java.util.jar.Attributes;
-import java.util.jar.JarEntry;
-import java.util.jar.JarOutputStream;
-import java.util.jar.Manifest;
-import org.apache.maven.artifact.Artifact;
+import java.util.Map;
+import java.util.function.Predicate;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -69,34 +58,23 @@ import org.apache.maven.plugins.annotations.ResolutionScope;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.project.MavenProjectHelper;
 import org.eclipse.aether.RepositorySystem;
-import org.eclipse.aether.artifact.DefaultArtifact;
-import org.eclipse.aether.resolution.ArtifactRequest;
 import org.eclipse.aether.resolution.ArtifactResolutionException;
-import tools.jackson.databind.InjectableValues;
-import tools.jackson.databind.json.JsonMapper;
-import tools.jackson.dataformat.yaml.YAMLMapper;
 
 /**
  * The {@code build} goal produces a self-contained executable JAR that runs an OpenDST simulation without Maven. All
  * bytecode instrumentation happens at build time.
  *
- * <p>Usage: {@code mvn opendst:build -Dopendst.descriptor=deployment.yaml}
+ * <p>The deployment topology is declared inline in the plugin {@code <configuration>} (a
+ * {@code <deployment>} of {@code <services>}); with none declared, it falls back to zero-config
+ * discovery. Usage: {@code mvn opendst:build}.
  *
  * <p>The produced JAR can then be run with: {@code java -jar target/<finalName>-opendst.jar}
  */
 @Mojo(name = "build", defaultPhase = LifecyclePhase.PACKAGE, requiresDependencyResolution = ResolutionScope.TEST)
 public class BuildMojo extends AbstractMojo {
-    private static final String OPENDST_AGENT_JAR = "/META-INF/agents/opendst-agent.jar";
-    private static final String OPENDST_RUNNER_JAR = "/META-INF/agents/opendst-runner.jar";
-    private static final String BOOTSTRAP_CLASS_NAME = "com.pingidentity.opendst.runner.Bootstrap";
-    private static final String INSTRUMENTED_APPS_DIR = "instrumented-apps";
 
-    private static final JsonMapper JSON_MAPPER = JsonMapper.builder()
-            .disable(FAIL_ON_TRAILING_TOKENS)
-            .disable(FAIL_ON_NULL_FOR_PRIMITIVES)
-            .disable(AUTO_CLOSE_SOURCE)
-            .enable(WRITE_ENUMS_USING_TO_STRING)
-            .build();
+    /** The simulation address space for zero-config mode. {@code 10.0.0.0} is the network address, so .1 up. */
+    private static final int MAX_ZEROCONF_SERVICES = 254;
 
     @Parameter(defaultValue = "${project}", readonly = true, required = true)
     private MavenProject project;
@@ -112,8 +90,13 @@ public class BuildMojo extends AbstractMojo {
     @org.apache.maven.plugins.annotations.Component
     private MavenProjectHelper projectHelper;
 
-    @Parameter(property = "opendst.descriptor", defaultValue = "${project.basedir}/deployment.yaml")
-    private File descriptor;
+    /**
+     * The deployment topology, declared inline in the plugin {@code <configuration>}. When omitted,
+     * {@code opendst:build} falls back to zero-config discovery (scanning compiled classes for a
+     * {@code main} method).
+     */
+    @Parameter
+    private DeploymentConfiguration deployment;
 
     @Parameter(
             property = "opendst.outputJar",
@@ -133,262 +116,60 @@ public class BuildMojo extends AbstractMojo {
             return;
         }
 
+        buildOpendstJar();
+        getLog().info("Built self-contained JAR " + outputJar.getName());
+        getLog().info("Run with: java -jar " + outputJar.getName());
+
+        projectHelper.attachArtifact(project, "jar", "opendst", outputJar);
+    }
+
+    /**
+     * Translates a deployment configuration into the self-contained JAR: a declared {@code <deployment>}
+     * (or, when absent, a zero-config scan) becomes a {@link RuntimeDeployment} whose apps are resolved,
+     * instrumented, and sealed into the jar. {@return that runtime deployment}.
+     *
+     * <p>The three steps are the whole build: interpret the config (and gather the apps behind it),
+     * instrument those apps into {@code apps/}, then write everything — instrumented apps, the OpenDST
+     * {@link SystemJars runtime}, and the runtime manifest — with {@link OpendstJar}.
+     */
+    private void buildOpendstJar() throws MojoExecutionException, MojoFailureException {
         Path basePath;
         try {
             basePath = project.getBasedir().toPath().toRealPath();
         } catch (IOException e) {
             throw new MojoExecutionException("Failed to resolve base path", e);
         }
+        // Interpret + resolve: the declared <deployment> (or a zero-config scan) becomes the runtime
+        // deployment plus the distinct resolved apps behind its services, deduplicated by output dir.
+        var config = deployment != null && !deployment.services().isEmpty() ? deployment : zeroConfig();
+        var apps = new LinkedHashMap<String, Classpath>();
+        var resolver = new ClasspathResolver(basePath, project, session, repositorySystem, getLog());
+        var runtimeDeployment = translate(config, resolver, apps);
 
-        // 1. Resolve deployment descriptor (explicit file or zero-config scan) and enrich services
-        var deploymentDescriptor = resolveDescriptor(basePath);
-        var enrichedDescriptor = enrichDescriptor(deploymentDescriptor);
-
-        // 2. Extract embedded JARs (agent, runner) from plugin classpath resources
-        var agentJarPath = extractEmbeddedJar(basePath, OPENDST_AGENT_JAR, "opendst-agent.jar");
-        var runnerJarPath = extractEmbeddedJar(basePath, OPENDST_RUNNER_JAR, "opendst-runner.jar");
-
-        // 2b. Generate opendst-patch.jar (patched VirtualThread + SimulatorThread)
-        var patchModuleJarPath =
-                basePath.resolve("target").resolve("opendst-package").resolve("opendst-patch.jar");
-        try {
-            PatchModuleGenerator.generate(patchModuleJarPath);
-        } catch (IOException e) {
-            throw new MojoExecutionException("Failed to generate opendst-patch.jar", e);
-        }
-
-        // 3. Resolve external artifacts and instrument all unique sources
-        var opendstBasePath = basePath.resolve("target").resolve("opendst-package");
-        var instrumentedAppsDir = opendstBasePath.resolve(INSTRUMENTED_APPS_DIR);
-        try {
-            deleteRecursively(basePath, instrumentedAppsDir);
-        } catch (IOException e) {
-            throw new MojoExecutionException("Failed to clean instrumented apps directory", e);
-        }
-
-        Set<Assertion> discoveredProperties;
-        try {
-            discoveredProperties = resolveAndInstrument(basePath, instrumentedAppsDir, deploymentDescriptor);
-        } catch (ArtifactResolutionException e) {
-            throw new MojoFailureException("Failed to resolve external artifact: " + e.getMessage(), e);
-        } catch (Instrumentation.AssertionValidationException e) {
+        // Build the jar: write the OpenDST runtime prologue, instrument each app straight into
+        // apps/<outputDir>/WEB-INF, then seal in the runtime manifest and the assertion catalog.
+        try (var executor = newFixedThreadPool(getRuntime().availableProcessors() * 2);
+                var jar = new OpendstJar(outputJar.toPath(), executor)) {
+            for (var classpath : apps.values()) {
+                getLog().info("Instrumenting %s from %s".formatted(classpath.outputDir(), classpath));
+                jar.addApp(classpath);
+            }
+            jar.seal(runtimeDeployment);
+        } catch (AssertionValidationException e) {
             throw new MojoFailureException(e.getMessage(), e);
-        } catch (IOException e) {
-            throw new MojoFailureException("Failed to instrument application code", e);
-        }
-
-        // 4. Build the self-contained JAR
-        try {
-            buildJar(
-                    instrumentedAppsDir,
-                    agentJarPath,
-                    runnerJarPath,
-                    patchModuleJarPath,
-                    enrichedDescriptor,
-                    discoveredProperties);
         } catch (IOException e) {
             throw new MojoExecutionException("Failed to build self-contained JAR", e);
         }
-
-        getLog().info("Built self-contained JAR: " + outputJar.getAbsolutePath());
-        getLog().info("Run with: java -jar " + outputJar.getName());
-        projectHelper.attachArtifact(project, "jar", "opendst", outputJar);
     }
 
     /**
-     * Enriches the parsed deployment descriptor for baking into the output JAR.
-     *
-     * <p>Every service's source is replaced with a {@link Source.Dir} whose path matches the
-     * {@code apps/} subdirectory name in the output JAR — computed by {@link Source#appDir()}.
-     * The same enrichment applies to the optional trace auditor.
+     * Synthesizes a deployment config from the compiled classes when no {@code <deployment>} is declared: one
+     * service per {@code main} class, named after it ({@code MyServer} → {@code my-server}) and addressed
+     * {@code 10.0.0.1}, {@code .2}, … in scan order, plus the project's {@code TraceAuditor} if it has exactly
+     * one. Every synthesized service is sourced from the current project's compile classes, so
+     * {@link #translate} resolves them to one shared app. {@return that config}.
      */
-    private DeploymentDescriptor enrichDescriptor(DeploymentDescriptor descriptor) {
-        var enrichedServices = new LinkedHashMap<String, ServiceDescriptor>();
-        for (var entry : descriptor.services().entrySet()) {
-            var svc = entry.getValue();
-            var enrichedDir = svc.appDir();
-            enrichedServices.put(
-                    entry.getKey(),
-                    new ServiceDescriptor(new Source.Dir(enrichedDir), svc.className(), svc.ip(), svc.args()));
-        }
-
-        TraceAuditorDescriptor enrichedTraceAuditor = null;
-        if (descriptor.traceAuditor() != null) {
-            var ta = descriptor.traceAuditor();
-            var enrichedDir = ta.appDir();
-            enrichedTraceAuditor = new TraceAuditorDescriptor(new Source.Dir(enrichedDir), ta.className());
-        }
-
-        return new DeploymentDescriptor(enrichedServices, enrichedTraceAuditor);
-    }
-
-    /**
-     * Resolves external artifacts and instruments all unique application sources.
-     *
-     * <p>Services (and the optional trace auditor) are grouped by their {@link Source#appDir()} to deduplicate:
-     * multiple services sharing the same source are instrumented only once.
-     *
-     * <p>Each unique source is dispatched via an exhaustive {@code switch} on {@link Source}:
-     * <ul>
-     *   <li>{@link Source.Artifact} — resolved from Maven repositories, unpacked, then instrumented</li>
-     *   <li>{@link Source.Dir} — an existing directory on disk, instrumented in-place</li>
-     *   <li>{@link Source.Project} — class directories plus dependency JARs, controlled by scope</li>
-     * </ul>
-     */
-    @SuppressWarnings("PMD.UnusedLocalVariable") // record pattern bindings required by switch
-    private Set<Assertion> resolveAndInstrument(
-            Path basePath, Path instrumentedAppsDir, DeploymentDescriptor originalDescriptor)
-            throws IOException, ArtifactResolutionException, MojoFailureException {
-        var log = getLog();
-
-        // Collect unique sources: appDir → Source
-        var uniqueSources = new LinkedHashMap<String, Source>();
-        for (var svc : originalDescriptor.services().values()) {
-            uniqueSources.putIfAbsent(svc.appDir(), svc.source());
-        }
-        if (originalDescriptor.traceAuditor() != null) {
-            var ta = originalDescriptor.traceAuditor();
-            uniqueSources.putIfAbsent(ta.appDir(), ta.source());
-        }
-
-        try (var executor = newFixedThreadPool(getRuntime().availableProcessors() * 2)) {
-            var instrumentation = new Instrumentation(basePath, instrumentedAppsDir, executor, log);
-            var allDiscovered = Instrumentation.newAssertionSet();
-
-            for (var entry : uniqueSources.entrySet()) {
-                var appDir = entry.getKey();
-                var source = entry.getValue();
-
-                switch (source) {
-                    case Source.Artifact(var gav, var appDirName) -> {
-                        var unpackedDir = resolveArtifact(basePath, appDir, gav);
-                        allDiscovered.addAll(instrumentation.instrumentAppDir(appDir, unpackedDir));
-                    }
-                    case Source.Dir(var path) -> {
-                        var sourceDir = basePath.resolve(path);
-                        if (!exists(sourceDir)) {
-                            throw new IOException("Non-existent directory: " + sourceDir);
-                        }
-                        allDiscovered.addAll(instrumentation.instrumentAppDir(appDir, sourceDir));
-                    }
-                    case Source.Project(var scope, var artifactId) -> {
-                        var classesDirs = scope.classesDirs(basePath);
-                        var dependencyJars = collectDependencyJars(scope);
-                        allDiscovered.addAll(instrumentation.instrumentClasses(appDir, classesDirs, dependencyJars));
-                    }
-                }
-            }
-            return allDiscovered;
-        }
-    }
-
-    /**
-     * Resolves a Maven artifact from a GAV coordinate, unpacks it to a temporary staging
-     * directory, and returns the path.
-     *
-     * @param basePath the project base directory
-     * @param appDir   the {@code apps/} subdirectory name (used for staging path)
-     * @param gav      the Maven GAV coordinate (e.g., {@code groupId:artifactId:packaging:version})
-     */
-    private Path resolveArtifact(Path basePath, String appDir, String gav)
-            throws ArtifactResolutionException, IOException {
-        getLog().info("Resolving artifact: " + gav);
-
-        var artifact = new DefaultArtifact(gav);
-        var request = new ArtifactRequest(artifact, project.getRemoteProjectRepositories(), null);
-        var resolved = repositorySystem.resolveArtifact(session.getRepositorySession(), request);
-
-        var stagingDir = basePath.resolve("target")
-                .resolve("opendst-package")
-                .resolve("staging")
-                .resolve(appDir);
-        unpackArchive(resolved.getArtifact().getFile().toPath(), stagingDir);
-        return stagingDir;
-    }
-
-    /**
-     * Collects dependency JARs for the given scope, excluding {@code opendst-sdk}
-     * (which is compile-only — its classes are redirected by instrumentation).
-     *
-     * <ul>
-     *   <li>{@link Scope#COMPILE} — compile + runtime scoped artifacts</li>
-     *   <li>{@link Scope#TEST} — compile + runtime + test scoped artifacts</li>
-     * </ul>
-     */
-    private List<Path> collectDependencyJars(Scope scope) {
-        var includeTest = scope == TEST;
-        var jars = new ArrayList<Path>();
-        for (var artifact : project.getArtifacts()) {
-            var artifactScope = artifact.getScope();
-            if (!Artifact.SCOPE_COMPILE.equals(artifactScope)
-                    && !Artifact.SCOPE_RUNTIME.equals(artifactScope)
-                    && !(includeTest && Artifact.SCOPE_TEST.equals(artifactScope))) {
-                continue;
-            }
-            if ("opendst-sdk".equals(artifact.getArtifactId())
-                    && "com.pingidentity.opendst".equals(artifact.getGroupId())) {
-                continue;
-            }
-            var jarFile = artifact.getFile();
-            if (jarFile != null && jarFile.getName().endsWith(".jar")) {
-                jars.add(jarFile.toPath());
-            }
-        }
-        return jars;
-    }
-
-    /**
-     * Unpacks an archive (WAR or JAR) into the given target directory, producing an
-     * exploded layout with {@code WEB-INF/classes/} and {@code WEB-INF/lib/}.
-     */
-    private static void unpackArchive(Path archiveFile, Path targetDir) throws IOException {
-        createDirectories(targetDir);
-        try (var archiveFs = newFileSystem(archiveFile, (ClassLoader) null)) {
-            var root = archiveFs.getPath("/");
-            try (var stream = walk(root)) {
-                for (var entry : stream.toList()) {
-                    var relativePath = root.relativize(entry).toString();
-                    if (relativePath.isEmpty()) {
-                        continue;
-                    }
-                    var target = targetDir.resolve(relativePath).normalize();
-                    if (!target.startsWith(targetDir.normalize())) {
-                        throw new IOException(
-                                "Zip-Slip: entry '" + relativePath + "' resolves outside target directory");
-                    }
-                    if (isDirectory(entry)) {
-                        createDirectories(target);
-                    } else {
-                        createDirectories(target.getParent());
-                        copy(entry, target, REPLACE_EXISTING);
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Resolves the {@link DeploymentDescriptor} to use for this build.
-     *
-     * <p>If {@code deployment.yaml} (the file at {@code opendst.descriptor}) exists, it is parsed
-     * via {@link #parseDescriptor()}.
-     *
-     * <p>Otherwise, zero-config mode activates: {@code target/classes} is scanned for classes with
-     * {@code public static void main(String[])} and for {@link com.pingidentity.opendst.sdk.TraceAuditor}
-     * implementors, and a {@link DeploymentDescriptor} is synthesized from the results.
-     *
-     * @param basePath the project base directory
-     * @return the resolved (or synthesized) descriptor
-     * @throws MojoFailureException if zero-config mode finds no main class, or finds more than one
-     *                              {@code TraceAuditor} implementor, or if the explicit descriptor
-     *                              cannot be parsed
-     */
-    private DeploymentDescriptor resolveDescriptor(Path basePath) throws MojoFailureException {
-        if (descriptor.isFile()) {
-            return parseDescriptor();
-        }
-
-        // Zero-config mode: no deployment.yaml present — scan compiled classes.
+    private DeploymentConfiguration zeroConfig() throws MojoFailureException {
         var classesDir = Path.of(project.getBuild().getOutputDirectory());
         List<String> mainClasses;
         List<String> traceAuditors;
@@ -400,246 +181,401 @@ public class BuildMojo extends AbstractMojo {
         }
 
         if (mainClasses.isEmpty()) {
-            throw new MojoFailureException(
-                    "Zero-config mode: no class with 'public static void main(String[])' was found"
-                            + " in " + classesDir + ". Add a main method to your class or create a"
-                            + " deployment.yaml to define your services explicitly.");
+            throw new MojoFailureException("Zero-config mode: no class with 'public static void main(String[])' was"
+                    + " found in " + classesDir + ". Add a main method to your class, or declare a <deployment> in"
+                    + " the plugin configuration to define your services explicitly.");
         }
-
-        if (mainClasses.size() > 254) {
+        if (mainClasses.size() > MAX_ZEROCONF_SERVICES) {
             throw new MojoFailureException("Zero-config mode: found " + mainClasses.size()
-                    + " main classes; cannot assign IPs beyond 10.0.0.254."
-                    + " Create a deployment.yaml to configure services explicitly.");
+                    + " main classes; cannot assign IPs beyond 10.0.0." + MAX_ZEROCONF_SERVICES
+                    + ". Declare a <deployment> in the plugin configuration to configure services explicitly.");
         }
-
         if (traceAuditors.size() > 1) {
             throw new MojoFailureException("Zero-config mode: more than one TraceAuditor implementor was found in "
-                    + classesDir + ": " + traceAuditors + ". Create a deployment.yaml to"
-                    + " specify the TraceAuditor explicitly.");
+                    + classesDir + ": " + traceAuditors
+                    + ". Declare a <deployment> in the plugin configuration to specify the TraceAuditor explicitly.");
         }
 
-        return synthesizeDescriptor(mainClasses, traceAuditors, project.getArtifactId());
-    }
-
-    /**
-     * Builds a {@link DeploymentDescriptor} from the results of a zero-config scan.
-     * Preconditions are enforced by the caller ({@link #resolveDescriptor}).
-     */
-    private DeploymentDescriptor synthesizeDescriptor(
-            List<String> mainClasses, List<String> traceAuditors, String artifactId) throws MojoFailureException {
-        assert !mainClasses.isEmpty() : "mainClasses must not be empty";
-        assert mainClasses.size() <= 254 : "mainClasses.size() must be <= 254";
-        assert traceAuditors.size() <= 1 : "traceAuditors must have at most one entry";
-
-        var services = new LinkedHashMap<String, ServiceDescriptor>();
+        var services = new ArrayList<DeploymentConfiguration.ServiceConfiguration>();
+        var byName = new HashMap<String, String>(); // service name -> className, for clash detection
         for (int i = 0; i < mainClasses.size(); i++) {
-            var fqcn = mainClasses.get(i);
-            var serviceName = MainClassScanner.toHostname(fqcn.substring(fqcn.lastIndexOf('.') + 1));
-            if (services.containsKey(serviceName)) {
-                var existing = services.get(serviceName).className();
-                throw new MojoFailureException("Zero-config mode: two classes produce the same service name '"
-                        + serviceName + "': [" + existing + ", " + fqcn + "]."
-                        + " Create a deployment.yaml to assign distinct service names.");
+            var className = mainClasses.get(i);
+            var name = MainClassScanner.toHostname(className.substring(className.lastIndexOf('.') + 1));
+            var clash = byName.putIfAbsent(name, className);
+            if (clash != null) {
+                throw new MojoFailureException("Zero-config mode: two classes produce the same service name '" + name
+                        + "': [" + clash + ", " + className + "]. Declare a <deployment> in the plugin"
+                        + " configuration to assign distinct service names.");
             }
-            // 10.0.0.x: private range used as simulation address space; starts at .1 since .0 is the network address.
-            services.put(
-                    serviceName,
-                    new ServiceDescriptor(
-                            new Source.Project(Scope.COMPILE, artifactId), fqcn, "10.0.0." + (i + 1), List.of()));
+            services.add(DeploymentConfiguration.ServiceConfiguration.of(name, className, "10.0.0." + (i + 1)));
         }
-
-        var traceAuditor = traceAuditors.isEmpty()
-                ? null
-                : new TraceAuditorDescriptor(new Source.Project(Scope.COMPILE, artifactId), traceAuditors.get(0));
-
-        return new DeploymentDescriptor(services, traceAuditor);
-    }
-
-    private DeploymentDescriptor parseDescriptor() throws MojoFailureException {
-        if (!descriptor.isFile()) {
-            throw new MojoFailureException("Deployment descriptor not found: " + descriptor.getAbsolutePath());
-        }
-        try {
-            return YAMLMapper.builder()
-                    .disable(FAIL_ON_NULL_FOR_PRIMITIVES)
-                    .disable(FAIL_ON_UNKNOWN_PROPERTIES)
-                    .build()
-                    .readerFor(DeploymentDescriptor.class)
-                    .with(new InjectableValues.Std().addValue(PROJECT_ARTIFACT_ID_KEY, project.getArtifactId()))
-                    .readValue(descriptor);
-        } catch (Exception e) {
-            throw new MojoFailureException("Failed to parse deployment descriptor: " + descriptor.getAbsolutePath(), e);
-        }
+        var auditor =
+                traceAuditors.isEmpty() ? null : DeploymentConfiguration.TraceAuditor.of(traceAuditors.getFirst());
+        return DeploymentConfiguration.of(services, auditor);
     }
 
     /**
-     * Extracts an embedded JAR from the plugin's classpath resources to a file
-     * under {@code target/opendst-package/}.
-     *
-     * @param basePath     the project base directory
-     * @param resourcePath the classpath resource path (e.g. {@code /META-INF/agents/opendst-agent.jar})
-     * @param fileName     the output file name (e.g. {@code opendst-agent.jar})
-     * @return the path to the extracted JAR
+     * Resolves {@code config} into the {@link RuntimeDeployment} baked into the JAR: each service's loose
+     * {@code artifact}/{@code dir}/{@code scope} fields are resolved to a {@link Classpath}, filling
+     * {@code apps} with the distinct ones (keyed and deduplicated by {@code outputDir} so a shared source is
+     * instrumented once). {@return that runtime deployment}. The child only needs which {@code apps/}
+     * directory a service's classes are in, never where they came from — so provenance is resolved here and
+     * the runtime never hears it.
      */
-    private Path extractEmbeddedJar(Path basePath, String resourcePath, String fileName) throws MojoFailureException {
-        try (var is = getClass().getResourceAsStream(resourcePath)) {
-            if (is == null) {
-                throw new MojoFailureException("Could not find embedded " + fileName);
-            }
-            var jarPath = basePath.resolve("target").resolve("opendst-package").resolve(fileName);
-            createDirectories(jarPath.getParent());
-            copy(is, jarPath, REPLACE_EXISTING);
-            return jarPath;
-        } catch (IOException e) {
-            throw new MojoFailureException("Failed to extract " + fileName, e);
-        }
-    }
-
-    /**
-     * Builds the self-contained JAR with this layout:
-     * <pre>
-     * META-INF/
-     *   MANIFEST.MF                     # Main-Class: Bootstrap
-     *   opendst/
-     *     assertions.json               # Serialized Set&lt;Assertion&gt;
-     *     deployment.json               # Runtime view of the enriched descriptor
-     *     build-config.json             # Build-time defaults (JVM args, faults)
-     * com/pingidentity/opendst/runner/Bootstrap.class  # Bootstrap (only class at root)
-     * system/
-     *   opendst-agent.jar               # Java agent (shaded fat JAR)
-     *   opendst-runner.jar              # Runner (shaded: picocli + Jackson + SnakeYAML + common)
-     *   opendst-patch.jar               # Patched VirtualThread + SimulatorThread (--patch-module)
-     * apps/
-     *   &lt;appDir&gt;/                       # Instrumented application content
-     *     WEB-INF/
-     *       classes.jar
-     *       lib/
-     * </pre>
-     */
-    private void buildJar(
-            Path instrumentedAppsDir,
-            Path agentJarPath,
-            Path runnerJarPath,
-            Path patchModuleJarPath,
-            DeploymentDescriptor enrichedDescriptor,
-            Set<Assertion> discoveredProperties)
-            throws IOException {
-        createDirectories(outputJar.toPath().getParent());
-
-        var manifest = new Manifest();
-        var mainAttributes = manifest.getMainAttributes();
-        mainAttributes.put(Attributes.Name.MANIFEST_VERSION, "1.0");
-        mainAttributes.put(Attributes.Name.MAIN_CLASS, BOOTSTRAP_CLASS_NAME);
-
-        try (var jos = new JarOutputStream(newOutputStream(outputJar.toPath()), manifest)) {
-            // 1. assertions.json
-            addEntry(jos, "META-INF/opendst/assertions.json", JSON_MAPPER.writeValueAsBytes(discoveredProperties));
-
-            // 2. Bootstrap.class at root — the only class needed for java -jar bootstrap
-            addBootstrapClass(jos, runnerJarPath);
-
-            // 3. system/ — all runtime JARs (loaded by Bootstrap's URLClassLoader after extraction)
-            addEntry(jos, "system/opendst-agent.jar", readAllBytes(agentJarPath));
-            addEntry(jos, "system/opendst-runner.jar", readAllBytes(runnerJarPath));
-            addEntry(jos, "system/opendst-patch.jar", readAllBytes(patchModuleJarPath));
-
-            // 4. apps/ — instrumented application artifacts
-            addInstrumentedApps(jos, instrumentedAppsDir);
-
-            // 5. deployment.json — runtime view of the enriched descriptor (jackson-jr-friendly)
-            addEntry(
-                    jos,
-                    "META-INF/opendst/deployment.json",
-                    JSON_MAPPER.writeValueAsBytes(toRuntimeDeployment(enrichedDescriptor, jvmArguments)));
-        }
-    }
-
-    /**
-     * Converts an enriched {@link DeploymentDescriptor} into the runtime-only view that
-     * gets baked into the self-contained JAR as {@code META-INF/opendst/deployment.json}.
-     *
-     * <p>By contract, every service's source has been resolved to a {@link Source.Dir}
-     * during enrichment (see {@code enrichDescriptor}); this method enforces that
-     * invariant explicitly.
-     */
-    private static RuntimeDeployment toRuntimeDeployment(DeploymentDescriptor descriptor, String jvmArguments) {
+    private RuntimeDeployment translate(
+            DeploymentConfiguration config, ClasspathResolver classPathResolver, Map<String, Classpath> apps)
+            throws MojoFailureException {
         var services = new LinkedHashMap<String, RuntimeService>();
-        descriptor
-                .services()
-                .forEach((name, svc) -> services.put(
-                        name, new RuntimeService(dirOf(svc.source()), svc.className(), svc.ip(), svc.args())));
-        var auditor = descriptor.traceAuditor() == null
-                ? null
-                : new RuntimeAuditor(
-                        dirOf(descriptor.traceAuditor().source()),
-                        descriptor.traceAuditor().className());
-        return new RuntimeDeployment(jvmArguments, services, auditor);
-    }
-
-    private static String dirOf(Source source) {
-        if (source instanceof Source.Dir dir) {
-            return dir.path();
+        try {
+            for (var service : config.services()) {
+                if (service.name() == null || service.name().isBlank()) {
+                    throw new MojoFailureException("Every <service> needs a <name>");
+                }
+                var cp = resolveSource(classPathResolver, service);
+                apps.putIfAbsent(cp.outputDir(), cp);
+                services.put(
+                        service.name(),
+                        new RuntimeService(
+                                cp.outputDir(),
+                                requireNonNull(service.className(), "<className>"),
+                                requireNonNull(service.ip(), "<ip>"),
+                                service.args()));
+            }
+            var declaredAuditor = config.traceAuditor();
+            RuntimeAuditor auditor = null;
+            if (declaredAuditor != null) {
+                var cp = resolveSource(classPathResolver, declaredAuditor);
+                apps.putIfAbsent(cp.outputDir(), cp);
+                auditor =
+                        new RuntimeAuditor(cp.outputDir(), requireNonNull(declaredAuditor.className(), "<className>"));
+            }
+            return new RuntimeDeployment(jvmArguments, services, auditor);
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw new MojoFailureException("Invalid <deployment> configuration: " + e.getMessage(), e);
+        } catch (IOException | ArtifactResolutionException e) {
+            throw new MojoFailureException("Failed to resolve application source: " + e.getMessage(), e);
         }
-        throw new IllegalStateException("Expected enriched descriptor with Source.Dir, got "
-                + source.getClass().getSimpleName());
     }
 
     /**
-     * Adds only {@code Bootstrap.class} at the JAR root. This is the sole class
-     * that must be loadable by {@code java -jar} without a custom classloader. All other
-     * classes are loaded by the {@link java.net.URLClassLoader} that {@code Bootstrap} creates
-     * from {@code system/*.jar} after extraction.
+     * Selects the {@link ClasspathResolver} method matching a {@link SourceConfiguration
+     * source}'s mutually-exclusive {@code artifact}/{@code dir}/{@code scope} selectors — the config-shape
+     * switch, kept here in the config interpreter so {@link ClasspathResolver} exposes only intent-named,
+     * single-kind resolve methods. {@return the resolved classpath}.
      *
-     * <p>Reads the class bytes from the embedded {@code opendst-runner} JAR.
-     *
-     * @param runnerJarPath path to the extracted opendst-runner JAR
+     * @throws IllegalArgumentException if more than one selector is set, or the scope value is unrecognized
      */
-    private void addBootstrapClass(JarOutputStream jos, Path runnerJarPath) throws IOException {
-        var launcherRelPath = BOOTSTRAP_CLASS_NAME.replace('.', '/') + ".class";
-
-        try (var jarFs = newFileSystem(runnerJarPath, (ClassLoader) null)) {
-            addEntry(jos, launcherRelPath, readAllBytes(jarFs.getPath(launcherRelPath)));
+    private static Classpath resolveSource(ClasspathResolver resolver, SourceConfiguration source)
+            throws IOException, ArtifactResolutionException {
+        var artifact = source.artifact();
+        var dir = source.dir();
+        var scope = source.scope();
+        boolean hasArtifact = artifact != null && !artifact.isBlank();
+        boolean hasDir = dir != null && !dir.isBlank();
+        boolean hasScope = scope != null && !scope.isBlank();
+        if ((hasArtifact ? 1 : 0) + (hasDir ? 1 : 0) + (hasScope ? 1 : 0) > 1) {
+            throw new IllegalArgumentException(
+                    "Only one of 'artifact', 'dir', or 'scope' can be set, but found multiple");
         }
+        if (hasArtifact) {
+            return resolver.resolveArtifact(artifact);
+        }
+        if (hasDir) {
+            return resolver.resolveDirectory(dir);
+        }
+        if (!hasScope || "compile".equals(scope)) {
+            return resolver.resolveCurrentProject();
+        }
+        if ("test".equals(scope)) {
+            return resolver.resolveCurrentProjectTests();
+        }
+        throw new IllegalArgumentException(
+                "Invalid scope '%s': valid values are 'compile' and 'test'".formatted(scope));
     }
 
-    private void addInstrumentedApps(JarOutputStream jos, Path instrumentedAppsDir) throws IOException {
-        if (!exists(instrumentedAppsDir)) {
-            return;
+    // ------------------------------------------------------------------
+    // Configuration surface — what a user writes in the pom.
+    //
+    // These are mutable beans with no-arg constructors because that is the only shape Maven's
+    // configurator can populate; zeroConfig() also builds them, and translate() turns them into a
+    // resolved deployment (records + a sealed App) that the rest of the build reasons about.
+    // ------------------------------------------------------------------
+
+    /**
+     * The deployment topology, declared inline in the plugin {@code <configuration>} — the pom-native
+     * replacement for {@code deployment.yaml}. When absent, {@code opendst:build} falls back to
+     * zero-config discovery (scanning the compiled classes for a {@code main} method).
+     *
+     * <pre>{@code
+     * <deployment>
+     *   <services>
+     *     <service>
+     *       <name>app</name>
+     *       <className>com.example.MyApp</className>
+     *       <ip>10.0.0.1</ip>
+     *     </service>
+     *   </services>
+     * </deployment>
+     * }</pre>
+     */
+    public static class DeploymentConfiguration {
+
+        private List<ServiceConfiguration> services = new ArrayList<>();
+        private TraceAuditor traceAuditor;
+
+        public List<ServiceConfiguration> services() {
+            return services;
         }
-        try (var stream = walk(instrumentedAppsDir)) {
-            for (var p : stream.filter(Files::isRegularFile).toList()) {
-                var relativePath = instrumentedAppsDir.relativize(p).toString().replace('\\', '/');
-                addEntry(jos, "apps/" + relativePath, readAllBytes(p));
+
+        public TraceAuditor traceAuditor() {
+            return traceAuditor;
+        }
+
+        /**
+         * Builds a deployment programmatically (zero-config {@link BuildMojo#zeroConfig() discovery}), bypassing
+         * Maven's XML configurator. A no-arg constructor still exists for that configurator; this is the
+         * code-side construction path.
+         */
+        private static DeploymentConfiguration of(List<ServiceConfiguration> services, TraceAuditor traceAuditor) {
+            var deployment = new DeploymentConfiguration();
+            deployment.services = services;
+            deployment.traceAuditor = traceAuditor;
+            return deployment;
+        }
+
+        /**
+         * The mutually-exclusive source selectors a {@code <service>} and a {@code <traceAuditor>} share —
+         * where its bytecode comes from ({@code <artifact>} / {@code <dir>} / {@code <scope>}, or none for the
+         * current project's compile classes). {@link BuildMojo#resolveSource resolveSource} consumes exactly
+         * this surface, blind to whether it is resolving a service or an auditor.
+         */
+        public interface SourceConfiguration {
+            String artifact();
+
+            String dir();
+
+            String scope();
+        }
+
+        /**
+         * One {@code <service>}: an application class and its network identity, plus where its bytecode
+         * comes from.
+         *
+         * <p>At most one source may be given — {@code <artifact>} (a {@code groupId:artifactId:version}
+         * coordinate, resolved from the repositories), {@code <dir>} (an already-built directory), or
+         * {@code <scope>} ({@code compile}/{@code test} of the current project). With none, the current
+         * project's compile classes are used.
+         */
+        public static class ServiceConfiguration implements SourceConfiguration {
+
+            private String name;
+            private String className;
+            private String ip;
+            private List<String> args = new ArrayList<>();
+            private String dir;
+            private String artifact;
+            private String scope;
+
+            /**
+             * Builds a zero-config service: named, classed, and addressed, sourced from the current
+             * project's compile classes (no {@code artifact}/{@code dir}/{@code scope}) with no args.
+             */
+            private static ServiceConfiguration of(String name, String className, String ip) {
+                var service = new ServiceConfiguration();
+                service.name = name;
+                service.className = className;
+                service.ip = ip;
+                return service;
+            }
+
+            public String name() {
+                return name;
+            }
+
+            public String className() {
+                return className;
+            }
+
+            public String ip() {
+                return ip;
+            }
+
+            public List<String> args() {
+                return args;
+            }
+
+            @Override
+            public String dir() {
+                return dir;
+            }
+
+            @Override
+            public String artifact() {
+                return artifact;
+            }
+
+            @Override
+            public String scope() {
+                return scope;
+            }
+        }
+
+        /**
+         * The optional {@code <traceAuditor>}: a class judged over the run's trace, with the same source
+         * model as a {@link ServiceConfiguration}.
+         */
+        public static class TraceAuditor implements SourceConfiguration {
+
+            private String className;
+            private String dir;
+            private String artifact;
+            private String scope;
+
+            /** Builds a zero-config trace auditor sourced from the current project's compile classes. */
+            private static TraceAuditor of(String className) {
+                var auditor = new TraceAuditor();
+                auditor.className = className;
+                return auditor;
+            }
+
+            public String className() {
+                return className;
+            }
+
+            @Override
+            public String dir() {
+                return dir;
+            }
+
+            @Override
+            public String artifact() {
+                return artifact;
+            }
+
+            @Override
+            public String scope() {
+                return scope;
             }
         }
     }
 
-    private static void addEntry(JarOutputStream jos, String name, byte[] content) throws IOException {
-        jos.putNextEntry(new JarEntry(name));
-        jos.write(content);
-        jos.closeEntry();
-    }
+    /**
+     * Scans compiled class files under a directory to discover the main-class candidates and
+     * {@code TraceAuditor} implementor that {@link #zeroConfig() zero-config discovery} synthesizes services
+     * from.
+     *
+     * <p>All scanning uses the Java ClassFile API ({@code java.lang.classfile}), consistent with existing
+     * usage in {@link Instrumentation} and {@link Instrumentation.AssertionScanner}.
+     */
+    static final class MainClassScanner {
 
-    /** Recursively deletes a directory, with safety checks to prevent deleting outside the project. */
-    private static void deleteRecursively(Path basePath, Path directoryToDelete) throws IOException {
-        if (!exists(directoryToDelete)) {
-            return;
+        private static final String TRACE_AUDITOR_INTERNAL_NAME = "com/pingidentity/opendst/sdk/TraceAuditor";
+
+        private static final MethodTypeDesc MAIN_DESCRIPTOR = MethodTypeDesc.of(CD_void, CD_String.arrayType());
+
+        private MainClassScanner() {}
+
+        /**
+         * Scans {@code .class} files under {@code classesDir} and returns the fully qualified class
+         * names of every class that declares {@code public static void main(String[])}.
+         *
+         * <p>Results are sorted alphabetically by simple class name (the part after the last {@code .}).
+         *
+         * @param classesDir the root directory to scan (e.g. {@code target/classes})
+         * @return an immutable list of FQCNs, sorted by simple name; empty if none found
+         * @throws IOException if reading any {@code .class} file fails
+         */
+        static List<String> scan(Path classesDir) throws IOException {
+            return walkClasses(classesDir, model -> model.methods().stream()
+                    .anyMatch(m -> m.methodName().stringValue().equals("main")
+                            && m.flags().has(AccessFlag.PUBLIC)
+                            && m.flags().has(AccessFlag.STATIC)
+                            && m.methodTypeSymbol().equals(MAIN_DESCRIPTOR)));
         }
-        var absoluteBase = basePath.toAbsolutePath();
-        if (absoluteBase.getParent() == null) {
-            throw new IllegalArgumentException("The base directory '%s' must not be the root".formatted(basePath));
-        } else if (!directoryToDelete.toRealPath().startsWith(absoluteBase)) {
-            throw new IllegalArgumentException(
-                    "Directory '%s' will not be deleted as it is outside '%s'".formatted(directoryToDelete, basePath));
+
+        /**
+         * Scans {@code .class} files under {@code classesDir} and returns the fully qualified class
+         * names of every class whose direct interface list includes
+         * {@code com.pingidentity.opendst.sdk.TraceAuditor}.
+         *
+         * <p>Results are sorted alphabetically by simple class name for deterministic diagnostic output.
+         *
+         * @param classesDir the root directory to scan (e.g. {@code target/classes})
+         * @return an immutable list of FQCNs, sorted by simple name; empty if none found
+         * @throws IOException if reading any {@code .class} file fails
+         */
+        static List<String> scanTraceAuditor(Path classesDir) throws IOException {
+            return walkClasses(classesDir, model -> model.interfaces().stream()
+                    .anyMatch(i -> i.asInternalName().equals(TRACE_AUDITOR_INTERNAL_NAME)));
         }
-        try (var stream = walk(directoryToDelete)) {
-            var paths = stream.sorted(Comparator.reverseOrder()).toList();
-            for (var path : paths) {
-                try {
-                    delete(path);
-                } catch (NoSuchFileException ignored) {
+
+        /**
+         * Walks {@code .class} files under {@code classesDir}, parses each with the ClassFile API,
+         * and returns the FQCNs of classes matching {@code predicate}, sorted by simple name.
+         */
+        private static List<String> walkClasses(Path classesDir, Predicate<ClassModel> predicate) throws IOException {
+            var cf = ClassFile.of();
+            var candidates = new ArrayList<String>();
+            try (var stream = walk(classesDir)) {
+                for (var it = stream.iterator(); it.hasNext(); ) {
+                    var path = it.next();
+                    if (!path.toString().endsWith(".class")) {
+                        continue;
+                    }
+                    var model = cf.parse(readAllBytes(path));
+                    if (predicate.test(model)) {
+                        candidates.add(model.thisClass().asInternalName().replace('/', '.'));
+                    }
                 }
             }
+            candidates.sort(Comparator.comparing(MainClassScanner::simpleName));
+            return List.copyOf(candidates);
+        }
+
+        /**
+         * Converts a simple class name to a hostname-safe service name.
+         *
+         * <ul>
+         *   <li>CamelCase word boundaries become {@code -}: {@code MyServer} → {@code my-server}.</li>
+         *   <li>Acronym runs are kept together: {@code FlakyDST} → {@code flaky-dst},
+         *       {@code MyDSTServer} → {@code my-dst-server}.</li>
+         *   <li>Digits are passed through and treated as word-boundary triggers for the next
+         *       uppercase letter: {@code Http2Client} → {@code http2-client}.</li>
+         *   <li>Underscores become {@code .} (subdomain separator): {@code My_Server} →
+         *       {@code my.server}.</li>
+         * </ul>
+         *
+         * @param simpleClassName the simple (unqualified) class name to convert
+         * @return the hostname-safe service name
+         */
+        static String toHostname(String simpleClassName) {
+            var sb = new StringBuilder();
+            int len = simpleClassName.length();
+            for (int i = 0; i < len; i++) {
+                char c = simpleClassName.charAt(i);
+                if (c == '_') {
+                    sb.append('.');
+                    continue;
+                }
+                if (isUpperCase(c) && i > 0) {
+                    char prev = simpleClassName.charAt(i - 1);
+                    char next = i + 1 < len ? simpleClassName.charAt(i + 1) : 0;
+                    // Insert hyphen at word boundaries:
+                    // - after a lowercase letter or digit (Http2Client → http2-client)
+                    // - at the end of an acronym run before a new word (DSTServer → dst-server)
+                    if (isLowerCase(prev) || isDigit(prev) || (isUpperCase(prev) && isLowerCase(next))) {
+                        sb.append('-');
+                    }
+                }
+                sb.append(toLowerCase(c));
+            }
+            return sb.toString();
+        }
+
+        /** Returns the simple name portion of a fully qualified class name. */
+        private static String simpleName(String fqcn) {
+            int dot = fqcn.lastIndexOf('.');
+            return dot >= 0 ? fqcn.substring(dot + 1) : fqcn;
         }
     }
 }

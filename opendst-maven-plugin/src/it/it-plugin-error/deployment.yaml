@@ -1,4 +1,0 @@
-services:
-  app:
-    class: com.pingidentity.opendst.it.invalidassertion.InvalidAssertionApp
-    ip: 10.0.0.1

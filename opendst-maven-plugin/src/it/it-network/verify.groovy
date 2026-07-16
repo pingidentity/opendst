@@ -57,9 +57,9 @@ try {
     def hasApps = jar.entries().any { it.name.startsWith("apps/") }
     check(hasApps, "No application content in apps/", logFile)
 
-    // Check that instrumented classes.jar exists
-    def hasClassesJar = jar.entries().any { it.name.contains("WEB-INF/classes.jar") }
-    check(hasClassesJar, "No WEB-INF/classes.jar in apps/", logFile)
+    // Check that instrumented classes exist under WEB-INF/classes/ (a directory, not a jar)
+    def hasClasses = jar.entries().any { it.name.contains("WEB-INF/classes/") && it.name.endsWith(".class") }
+    check(hasClasses, "No instrumented classes under WEB-INF/classes/ in apps/", logFile)
 
     // Verify assertions.json contains the expected assertions
     def assertionsEntry = jar.getEntry("META-INF/opendst/assertions.json")

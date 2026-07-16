@@ -1,8 +1,0 @@
-services:
-  app:
-    class: com.pingidentity.opendst.it.instrumentation.RxApp
-    ip: 10.0.0.1
-  test-app:
-    class: com.pingidentity.opendst.it.instrumentation.RxTestApp
-    ip: 10.0.0.2
-    scope: test
